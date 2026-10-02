@@ -1,0 +1,64 @@
+[project]
+name = "self-play-pretrain-zero-data"
+version = "0.0.1"
+description = "Implementation of Self-Play Pretraining with Zero Data"
+authors = [
+    { name = "Phil Wang", email = "lucidrains@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">= 3.10"
+license = { file = "LICENSE" }
+keywords = [
+    'artificial intelligence',
+    'deep learning',
+    'self-play',
+    'pretraining',
+    'synthetic data'
+]
+
+classifiers=[
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python :: 3.10',
+]
+
+dependencies = [
+    "bfi>=1.1.1",
+    "einx>=0.3.0",
+    "einops>=0.8.1",
+    "torch>=2.5",
+    "torch-einops-utils>=0.0.29",
+    "x-transformers"
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/self-play-pretrain-zero-data/"
+Repository = "https://github.com/lucidrains/self-play-pretrain-zero-data"
+
+[project.optional-dependencies]
+examples = []
+test = [
+    "pytest"
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+    "."
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = [
+    "self_play_pretrain_zero_data",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["self_play_pretrain_zero_data"]
