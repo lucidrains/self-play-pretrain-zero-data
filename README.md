@@ -15,3 +15,15 @@ Implementation of [Self-Play Pretraining with Zero Data](https://arxiv.org/abs/2
     url      = {https://arxiv.org/abs/2609.30063}, 
 }
 ```
+
+```bibtex
+@misc{bloem2025universalpretrainingiteratedrandom,
+    title   = {Universal pre-training by iterated random computation}, 
+    author  = {Peter Bloem},
+    year    = {2025},
+    eprint  = {2506.20057},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2506.20057}, 
+}
+```
