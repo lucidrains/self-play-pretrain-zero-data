@@ -19,6 +19,19 @@ Implementation of [Self-Play Pretraining with Zero Data](https://arxiv.org/abs/2
 ```
 
 ```bibtex
+@software{Morehead_JVP_Flash_Attention_2025,
+    author  = {Morehead, Alex},
+    doi     = {10.5281/zenodo.17050188},
+    license = {MIT},
+    month   = {sep},
+    title   = {JVP Flash Attention},
+    url     = {https://github.com/amorehead/jvp_flash_attention},
+    version = {0.14.0},
+    year    = {2025}
+}
+```
+
+```bibtex
 @misc{bloem2025universalpretrainingiteratedrandom,
     title   = {Universal pre-training by iterated random computation},
     author  = {Peter Bloem},
