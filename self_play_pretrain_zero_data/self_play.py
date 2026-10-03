@@ -44,6 +44,7 @@ class Attention(Module):
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
 
+        self.norm = RMSNorm(dim)
         self.to_qkv = LinearNoBias(dim, dim_inner * 3)
         self.to_out = LinearNoBias(dim_inner, dim)
 
@@ -56,6 +57,8 @@ class Attention(Module):
         rotary_emb = None
     ):
         device = x.device
+
+        x = self.norm(x)
 
         q, k, v = self.to_qkv(x).chunk(3, dim = -1)
 
@@ -90,12 +93,14 @@ class FeedForward(Module):
         super().__init__()
         dim_inner = int(dim * expansion * 2 / 3)
 
+        self.norm = RMSNorm(dim)
         self.proj_in = Linear(dim, dim_inner * 2)
         self.proj_out = Linear(dim_inner, dim)
 
     def forward(self, x):
-
+        x = self.norm(x)
         x, gates = self.proj_in(x).chunk(2, dim = -1)
+
         x = x * F.gelu(gates)
         return self.proj_out(x)
 
