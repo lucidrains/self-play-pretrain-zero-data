@@ -1,7 +1,7 @@
 import random
 
 from self_play_pretrain_zero_data import Brainfuck
-from self_play_pretrain_zero_data.brainfuck import MACROS
+from self_play_pretrain_zero_data.executors.brainfuck import MACROS
 
 HELLO_WORLD = (
     "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]"
@@ -30,9 +30,20 @@ def test_macros_effects():
     assert Brainfuck()('X.') == '\x10'  # set cell to 16
 
 
+def test_custom_macros():
+    assert Brainfuck()('Q.') == '\x00'
+    assert Brainfuck(macros = {'Q': '+++'})('Q.') == '\x03'
+    assert Brainfuck(macros = {})('X.') == '\x00'
+
+
 def test_unmatched_brackets_are_noops():
     assert Brainfuck()('+[+.') == '\x02'
     assert Brainfuck()('+.].') == '\x01\x01'
+
+
+def test_unmatched_brackets_can_halt():
+    assert Brainfuck()('[+.') == '\x01'
+    assert Brainfuck(unmatched_brackets_are_noops=False)('[+.') == ''
 
 
 def test_circular_tape():
@@ -41,9 +52,15 @@ def test_circular_tape():
     assert Brainfuck(tape_size=4)('<' * 5 + '+.') == '\x01'
 
 
+def test_tape_wrapping_can_be_disabled():
+    program = '+++++++' + '<' * 5 + '>' * 5 + '.'
+    assert Brainfuck(tape_size=4)(program) == '\x07'
+    assert Brainfuck(tape_size=4, wrap_tape=False)(program) == '\x00'
+
+
 def test_cells_wrap_modulo():
     assert Brainfuck()('-.') == '\xff'
-    assert Brainfuck(modulus=3)('++++.') == '\x01'
+    assert Brainfuck(cell_modulus=3)('++++.') == '\x01'
 
 
 def test_random_input_tape():
@@ -52,8 +69,27 @@ def test_random_input_tape():
     assert Brainfuck()(',.', seed=0) == chr(random.Random(0).randrange(256))
 
 
+def test_input_fallback_can_be_zeros():
+    assert Brainfuck(random_input=False)(',.', input='A') == 'A'
+    assert Brainfuck(random_input=False)(',.') == '\x00'
+
+
 def test_halts_at_f():
     assert Brainfuck()('+.F+.') == '\x01'
+
+
+def test_halt_symbol_is_customizable():
+    assert Brainfuck()('+.F+.') == '\x01'
+    assert Brainfuck(halt_symbol='!')('+.F+.') == '\x01\x02'
+    assert Brainfuck(halt_symbol=None)('+.F+.') == '\x01\x02'
+
+
+def test_cell_modulus_larger_than_byte():
+    assert Brainfuck(cell_modulus=512)('+' * 300 + '.') == chr(300 % 256)
+
+
+def test_unicode_input():
+    assert Brainfuck()(',.', input='世') == chr(ord('世') % 256)
 
 
 def test_halts_at_step_budget():

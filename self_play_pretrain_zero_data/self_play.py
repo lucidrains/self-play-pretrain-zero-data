@@ -1,26 +1,18 @@
 from __future__ import annotations
 from typing import Iterable
-from abc import ABC, abstractmethod
 
 from torch.nn import Module
 
-# executor
+from self_play_pretrain_zero_data.executors import Executor
 
-class ProgramExecutor(ABC):
-    """maps a program string to its output string"""
-
-    @abstractmethod
-    def __call__(self, program: str, **kwargs) -> str:
-        raise NotImplementedError
-
-# main class
+# classes
 
 class SelfPlay(Module):
     def __init__(
         self,
         generator: Module,
         learner: Module,
-        executor: ProgramExecutor
+        executor: Executor
     ):
         super().__init__()
         self.generator = generator
@@ -30,13 +22,21 @@ class SelfPlay(Module):
     def execute(
         self,
         programs: str | Iterable[str],
+        seed = None,
         **kwargs
     ) -> str | list[str]:
 
         if isinstance(programs, str):
-            return self.executor(programs, **kwargs)
+            assert not isinstance(seed, Iterable), 'seed must be a single int or None for a single program'
+            return self.executor(programs, seed = seed, **kwargs)
 
-        return [self.executor(program, **kwargs) for program in programs]
+        if isinstance(seed, Iterable):
+            return [self.executor(program, seed = s, **kwargs) for program, s in zip(programs, seed, strict = True)]
+
+        return [
+            self.executor(program, seed = (seed + i) if seed is not None else None, **kwargs)
+            for i, program in enumerate(programs)
+        ]
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
