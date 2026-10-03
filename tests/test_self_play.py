@@ -1,27 +1,25 @@
-import pytest
-from self_play_pretrain_zero_data import Executor, SelfPlay
+import torch
+from self_play_pretrain_zero_data import Brainfuck, SelfPlay
+from self_play_pretrain_zero_data.self_play import Transformer
 
+def test_transformer():
+    ids = torch.randint(0, 256, (1, 1024))
 
-def test_self_play_executes_programs():
-    class Echo(Executor):
-        def __call__(self, program, **kwargs):
-            return program
+    model = Transformer(num_tokens = 256, dim = 512, depth = 6)
 
-    self_play = SelfPlay(generator = None, learner = None, executor = Echo())
+    assert model(ids).shape == (1, 1024, 256)
 
-    assert self_play.execute_program('foo') == 'foo'
-    assert self_play.execute_program(['foo', 'bar']) == ['foo', 'bar']
+def test_self_play():
 
-    with pytest.raises(NotImplementedError):
-        self_play('foo')
+    brainfuck = Brainfuck()
 
+    learner = Transformer(num_tokens = 256, dim = 512, depth = 6)
+    generator = Transformer(num_tokens = 256, dim = 512, depth = 6)
 
-def test_self_play_passes_kwargs():
-    class RecordSeed(Executor):
-        def __call__(self, program, seed = None):
-            return seed
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = brainfuck
+    )
 
-    self_play = SelfPlay(generator = None, learner = None, executor = RecordSeed())
-
-    assert self_play.execute_program('a', seed = 42) == 42
-    assert self_play.execute_program(['a', 'b'], seed = 42) == [42, 42]
+    assert self_play.execute_programs(['+++.']) == ['\x03']

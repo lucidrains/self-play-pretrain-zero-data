@@ -31,4 +31,4 @@ def test_bct():
 def test_self_play_accepts_contrived_executor():
     self_play = SelfPlay(generator = None, learner = None, executor = BCT())
 
-    assert self_play.execute_program(['0', '01'], input = '10') == ['10', '1']
+    assert self_play.execute_programs(['0', '01'], input = '10') == ['10', '1']
