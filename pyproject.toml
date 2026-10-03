@@ -25,7 +25,6 @@ classifiers=[
 ]
 
 dependencies = [
-    "bfi>=1.1.1",
     "einx>=0.3.0",
     "einops>=0.8.1",
     "torch>=2.5",
