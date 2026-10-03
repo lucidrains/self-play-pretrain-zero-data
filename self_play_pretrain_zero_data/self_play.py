@@ -1,10 +1,11 @@
 from __future__ import annotations
 from functools import partial
 from math import ceil
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import nn, arange, cat, full, tensor
+from torch import nn, arange, cat, stack, full, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm
 from torch.optim import Adam, AdamW
 from torch.func import functional_call, jvp
@@ -12,7 +13,7 @@ from torch.func import functional_call, jvp
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import clamp, mask_before, masked_mean, pack_with_inverse, pad_sequence, temp_eval, tree_map_detach
+from torch_einops_utils import clamp, mask_after, masked_mean, pack_with_inverse, pad_sequence, temp_eval, tree_map_detach
 from torch_einops_utils.shape import shape, size
 from torch_einops_utils.torch_einops_utils import identity
 
@@ -209,7 +210,9 @@ class Transformer(Module):
         filter_logits_fn = top_k,
         filter_thres = 0.9,
         eos_id = None,
-        pad_value = None
+        pad_value = None,
+        decode_fn = None,
+        mask_out_eos_on_first_step = True
     ):
         eos_id = default(eos_id, self.sos_eos_id)
         pad_value = default(pad_value, eos_id)
@@ -237,9 +240,14 @@ class Transformer(Module):
 
         # sample until every sequence has emitted eos
 
-        for _ in range(max_length):
+        for step in range(max_length):
             logits, memory = self.forward(ids, memory = memory, return_memory = True)
             logits = logits[:, -1:]
+
+            # on the very first step, mask out the sos / eos id so generation cannot immediately terminate
+
+            if mask_out_eos_on_first_step and step == 0:
+                logits = logits.masked_fill(arange(self.num_tokens, device = device) == eos_id, -torch.finfo(logits.dtype).max)
 
             # filter and sample
 
@@ -254,11 +262,18 @@ class Transformer(Module):
             if (out == eos_id).any(dim = -1).all():
                 break
 
-        # mask out everything after the eos token
+        # mask out everything after the first eos, leaving sequences that never emitted eos untouched
 
-        out = out.masked_fill(mask_before(out, eos_id, inclusive = False), pad_value)
+        out = out.masked_fill(~mask_after(out, eos_id, inclusive = True), pad_value)
 
-        return unpack(out[:, prompt_len:])
+        out = unpack(out[:, prompt_len:])
+
+        # maybe decode the sampled ids into programs
+
+        if not exists(decode_fn):
+            return out
+
+        return [decode_fn(ids) for ids in out.tolist()]
 
     def forward_with_jvp(
         self,
@@ -374,13 +389,13 @@ class Transformer(Module):
             rearrange(logits, 'b n v -> b v n'),
             labels,
             ignore_index = pad_id,
-            reduction = 'mean' if reduce_loss else 'none'
+            reduction = 'none'
         )
 
-        if reduce_loss:
-            return loss
-
         loss_mask = labels != pad_id
+
+        if reduce_loss:
+            return masked_mean(loss, loss_mask)
 
         return loss, loss_mask
 
@@ -392,23 +407,38 @@ def char_encode(strings):
         value = -1
     )
 
-# default learner direction
+# default learner lookback - the checkpoint from half of the epochs ago
 
-def adam_direction(param, state, eps = 1e-8):
-    exp_avg, exp_avg_sq = state.get('exp_avg'), state.get('exp_avg_sq')
+def default_lookback_epoch_fn(epoch):
+    return epoch // 2
 
-    if not exists(exp_avg):
-        return -torch.ones_like(param)
+# default learner preconditioning - the diagonal AdamW step operator from the paper
+# P = lr / (sqrt(v_hat) + eps)
 
-    return (-exp_avg / (exp_avg_sq.sqrt() + eps)).detach()
+def adam_preconditioning(param, state, param_group):
+    lr = param_group.get('lr', 1e-3)
+    eps = param_group.get('eps', 1e-8)
+    _, beta2 = param_group.get('betas', (0.9, 0.999))
 
-DIRECTION_FNS = {
-    Adam: adam_direction,
-    AdamW: adam_direction
+    exp_avg_sq = state.get('exp_avg_sq')
+
+    if not exists(exp_avg_sq):
+        return torch.full_like(param, lr / eps)
+
+    step = state.get('step', 0)
+    step = step.item() if is_tensor(step) else step
+
+    v_hat = exp_avg_sq / (1 - beta2 ** step) if step > 0 else exp_avg_sq
+
+    return (lr / (v_hat.sqrt() + eps)).detach()
+
+PRECONDITIONING_FNS = {
+    Adam: adam_preconditioning,
+    AdamW: adam_preconditioning
 }
 
-def register_direction(optimizer_type, direction_fn):
-    DIRECTION_FNS[optimizer_type] = direction_fn
+def register_preconditioning(optimizer_type, preconditioning_fn):
+    PRECONDITIONING_FNS[optimizer_type] = preconditioning_fn
 
 # classes
 
@@ -420,8 +450,11 @@ class SelfPlay(Module):
         executor: Executor,
         learned_tokenizer_encode = None,
         learner_optimizer = None,
-        learner_direction_fn = None,
-        learner_lr = 3e-4
+        learner_preconditioning_fn = None,
+        learner_lr = 3e-4,
+        learner_checkpoint_folder = 'learner_checkpoints',
+        learner_lookback_epoch_fn = None,
+        learner_checkpoint_strict = True
     ):
         super().__init__()
 
@@ -446,22 +479,86 @@ class SelfPlay(Module):
 
         self.learner_optimizer = learner_optimizer
 
-        # default learner direction
+        # default learner preconditioning derived from the optimizer
 
-        self.learner_direction_fn = default(learner_direction_fn, DIRECTION_FNS.get(type(learner_optimizer)))
+        self.learner_preconditioning_fn = default(learner_preconditioning_fn, PRECONDITIONING_FNS.get(type(learner_optimizer)))
+
+        # persistent epoch counter
+
+        self.register_buffer('epoch', tensor(0, dtype = torch.long))
+
+        # learner checkpoints, used to derive parameter differences over the lookback window
+
+        self.learner_checkpoint_folder = Path(learner_checkpoint_folder)
+        self.learner_checkpoint_folder.mkdir(parents = True, exist_ok = True)
+
+        # lookback checkpoint selection for the generator reward
+
+        self.learner_lookback_epoch_fn = default(learner_lookback_epoch_fn, default_lookback_epoch_fn)
+        self.learner_checkpoint_strict = learner_checkpoint_strict
+
+        self.save_checkpoint()
+
+    def checkpoint_path(self, epoch):
+        return self.learner_checkpoint_folder / f'learner.{int(epoch)}.pt'
+
+    def nearest_checkpoint_epoch(self, epoch):
+        checkpoint_epochs = sorted(int(path.stem.split('.')[-1]) for path in self.learner_checkpoint_folder.glob('learner.*.pt'))
+        assert len(checkpoint_epochs) > 0, f'no learner checkpoints found in {self.learner_checkpoint_folder}'
+        return min(checkpoint_epochs, key = lambda e: abs(e - epoch))
+
+    def save_checkpoint(self, epoch = None):
+        epoch = default(epoch, self.epoch.item())
+        torch.save(self.learner.state_dict(), self.checkpoint_path(epoch))
+
+    def load_checkpoint(self, epoch, strict = None):
+        # strict fails on a missing checkpoint, else the nearest one is used
+
+        if not default(strict, self.learner_checkpoint_strict):
+            epoch = self.nearest_checkpoint_epoch(epoch)
+
+        path = self.checkpoint_path(epoch)
+        assert path.exists(), f'no learner checkpoint found at {path}'
+
+        return torch.load(path, map_location = 'cpu', weights_only = True)
+
+    def parameter_difference(self, epoch, strict = None):
+        # δθ = θ_past − θ_now
+
+        past_params = self.load_checkpoint(epoch, strict = strict)
+
+        return {
+            name: (past_params[name].to(param) - param).detach()
+            for name, param in self.learner.named_parameters()
+        }
 
     @property
-    def learner_direction(self):
-        direction_fn = self.learner_direction_fn
-        assert exists(direction_fn), 'no learner direction fn could be derived from the optimizer'
+    def learner_preconditioning(self):
+        preconditioning_fn = self.learner_preconditioning_fn
+        assert exists(preconditioning_fn), 'no learner preconditioning fn could be derived from the optimizer'
 
-        direction = {}
+        param_groups = {
+            id(param): param_group
+            for param_group in self.learner_optimizer.param_groups
+            for param in param_group['params']
+        }
+
+        preconditioning = dict()
 
         for name, param in self.learner.named_parameters():
+            param_group = param_groups.get(id(param), dict())
             state = self.learner_optimizer.state.get(param, dict())
-            direction[name] = direction_fn(param, state)
+            preconditioning[name] = preconditioning_fn(param, state, param_group)
 
-        return direction
+        return preconditioning
+
+    def preconditioned_parameter_difference(self, epoch, strict = None):
+        # preconditioned lookback tangent P ⊙ δθ, i.e. the generator reward
+
+        difference = self.parameter_difference(epoch, strict = strict)
+        preconditioning = self.learner_preconditioning
+
+        return {name: preconditioning[name] * diff for name, diff in difference.items()}
 
     def forward(
         self,
@@ -470,41 +567,71 @@ class SelfPlay(Module):
         temperature = 1.,
         filter_thres = 0.9,
         verbose = True,
-        learner_optim_step = False
+        num_epochs = 1,
+        decode_fn = None
     ):
         assert batch_size > 1, 'batch size must be greater than 1 for grpo'
+        assert num_epochs >= 1
 
-        # generate a batch of programs, listening for eos
+        # default decode fn is the executor's
 
-        program_ids = self.generator.generate(
-            batch_size = batch_size,
-            max_length = max_length,
-            temperature = temperature,
-            filter_thres = filter_thres,
-            eos_id = self.executor.sos_eos_id
-        )
+        decode_fn = default(decode_fn, self.executor.decode)
 
-        programs = [self.executor.decode(ids) for ids in program_ids.tolist()]
+        # accumulants
 
-        # execute the programs
+        losses = []
+        loss_tangents = []
 
-        outputs = [self.executor(program) for program in programs]
+        for _ in range(num_epochs):
+            # generate a batch of decoded programs, listening for eos
 
-        if verbose:
-            for program, output in zip(programs, outputs):
-                print(f'{program!r} -> {output!r}')
+            programs = self.generator.generate(
+                batch_size = batch_size,
+                max_length = max_length,
+                temperature = temperature,
+                filter_thres = filter_thres,
+                eos_id = self.executor.sos_eos_id,
+                decode_fn = decode_fn
+            )
 
-        # encode executor outputs for the learner, and take a loss + tangent along the adam direction
+            # execute the programs
 
-        ids = self.learned_tokenizer_encode(outputs)
+            outputs = [self.executor(program) for program in programs]
 
-        loss, tangent = self.learner.forward_with_jvp(ids, self.learner_direction, detach_params = False)
+            if verbose:
+                for program, output in zip(programs, outputs):
+                    print(f'{program!r} -> {output!r}')
 
-        # maybe simple learner optimizer step
+            # encode executor outputs for the learner
 
-        if learner_optim_step:
+            ids = self.learned_tokenizer_encode(outputs)
+
+            # learner step on next token prediction
+
+            loss = self.learner(ids, return_loss = True, reduce_loss = True)
             loss.backward()
+
             self.learner_optimizer.step()
             self.learner_optimizer.zero_grad()
 
-        return loss, tangent
+            # advance epoch, checkpoint the learner
+
+            self.epoch.add_(1)
+            self.save_checkpoint()
+
+            # preconditioned lookback tangent, used as the generator reward
+
+            tangent = self.preconditioned_parameter_difference(self.learner_lookback_epoch_fn(self.epoch.item()))
+
+            _, loss_tangent = self.learner.forward_with_jvp(ids, tangent)
+
+            # handle rl and reward weighted sft
+
+            # todo - grpo / sft
+
+            # accumulate
+
+            losses.append(loss.detach())
+            loss_tangents.append(loss_tangent)
+
+        return stack(losses), stack(loss_tangents)

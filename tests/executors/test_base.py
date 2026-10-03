@@ -38,14 +38,14 @@ def test_bct():
     assert BCT(max_steps = 11)('00111', input = '101') == '10110'
     assert BCT()('') == ''
 
-def test_self_play_accepts_contrived_executor():
+def test_self_play_accepts_contrived_executor(tmp_path):
     executor = BCT()
 
     generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2, sos_eos_id = executor.sos_eos_id)
     learner = Transformer(num_tokens = 256, dim = 16, depth = 1, dim_head = 8, heads = 2)
 
-    self_play = SelfPlay(generator = generator, learner = learner, executor = executor)
+    self_play = SelfPlay(generator = generator, learner = learner, executor = executor, learner_checkpoint_folder = tmp_path)
 
-    loss, tangent = self_play(batch_size = 2, max_length = 4, verbose = False)
+    loss, tangent = self_play(batch_size = 2, max_length = 4, verbose = False, decode_fn = executor.decode)
 
-    assert tangent.shape == (2,)
+    assert tangent.shape == (1, 2)
