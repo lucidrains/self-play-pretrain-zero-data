@@ -31,7 +31,28 @@ def input_stream(
 # classes
 
 class Executor(ABC):
-    """maps a program string to its output string"""
+    """maps a program string to its output string
+
+    token id 0 is reserved for sos / eos
+    """
+
+    num_tokens: int
+    sos_eos_id = 0
+    pad_id = -1
+
+    @abstractmethod
+    def encode(
+        self,
+        program: str
+    ) -> list[int]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def decode(
+        self,
+        ids: list[int]
+    ) -> str:
+        raise NotImplementedError
 
     @abstractmethod
     def __call__(

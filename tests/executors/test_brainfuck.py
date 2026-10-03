@@ -103,3 +103,16 @@ def test_halts_at_output_cap():
 def test_every_string_is_executable():
     for program in ('[', ']', '[[', '?qZ', '+-<>[],.', ''):
         assert isinstance(Brainfuck()(program), str)
+
+
+def test_tokenizer():
+    brainfuck = Brainfuck()
+
+    assert brainfuck.sos_eos_id == 0
+    assert brainfuck.num_tokens == len(brainfuck.alphabet) + 1
+    assert brainfuck.decode([brainfuck.sos_eos_id]) == ''
+
+    for program in (HELLO_WORLD, '+++.', 'ZR>+<.,[]F'):
+        ids = brainfuck.encode(program)
+        assert all(0 < i < brainfuck.num_tokens for i in ids)
+        assert brainfuck.decode(ids) == program

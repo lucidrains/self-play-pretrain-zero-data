@@ -1,6 +1,6 @@
 [project]
 name = "self-play-pretrain-zero-data"
-version = "0.0.5"
+version = "0.0.6"
 description = "Implementation of Self-Play Pretraining with Zero Data"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

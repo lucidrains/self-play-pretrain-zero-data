@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import string
 
 from self_play_pretrain_zero_data.executors.base import Executor, input_stream
 
@@ -78,6 +79,21 @@ class Forth(Executor):
         self.stack_underflow_is_zero = stack_underflow_is_zero
         self.random_input = random_input
         self.case_sensitive = case_sensitive
+
+        # tokenizer - char level, id 0 is reserved for sos / eos
+
+        alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits + ' ' + '+-*='
+
+        self.alphabet = ''.join(dict.fromkeys(alphabet))
+        self.num_tokens = len(self.alphabet) + 1
+        self.token_to_id = {token: ind + 1 for ind, token in enumerate(self.alphabet)}
+        self.id_to_token = {ind: token for token, ind in self.token_to_id.items()}
+
+    def encode(self, program: str) -> list[int]:
+        return [self.token_to_id[token] for token in program]
+
+    def decode(self, ids: list[int]) -> str:
+        return ''.join(self.id_to_token[i] for i in ids if i != self.sos_eos_id and i != self.pad_id)
 
     def __call__(
         self,

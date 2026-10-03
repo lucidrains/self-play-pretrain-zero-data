@@ -8,6 +8,8 @@ from self_play_pretrain_zero_data.executors.base import (
 
 # single byte macro instructions from appendix E (table 4)
 
+INSTRUCTIONS = '><+-.,[]'
+
 MACROS = {
     'Z': '[-]',
     'R': '[->+<]',
@@ -75,6 +77,23 @@ class Brainfuck(Executor):
         self.unmatched_brackets_are_noops = unmatched_brackets_are_noops
         self.random_input = random_input
         self.macros = default(macros, MACROS)
+
+        # tokenizer - id 0 is reserved for sos / eos
+
+        alphabet = INSTRUCTIONS + ''.join(self.macros)
+        if self.halt_symbol:
+            alphabet += self.halt_symbol
+
+        self.alphabet = ''.join(dict.fromkeys(alphabet))
+        self.num_tokens = len(self.alphabet) + 1
+        self.token_to_id = {token: ind + 1 for ind, token in enumerate(self.alphabet)}
+        self.id_to_token = {ind: token for token, ind in self.token_to_id.items()}
+
+    def encode(self, program: str) -> list[int]:
+        return [self.token_to_id[token] for token in program]
+
+    def decode(self, ids: list[int]) -> str:
+        return ''.join(self.id_to_token[i] for i in ids if i != self.sos_eos_id and i != self.pad_id)
 
     def move(self, ptr: int, step: int) -> int:
         if self.wrap_tape:

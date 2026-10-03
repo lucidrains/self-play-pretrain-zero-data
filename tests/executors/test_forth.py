@@ -94,3 +94,16 @@ def test_halts_at_output_cap():
 def test_every_string_is_executable():
     for program in ('IF', 'THEN', 'ELSE', 'UNTIL', 'BEGIN', '?q', ': foo ;', '', '9' * 5000 + ' EMIT'):
         assert isinstance(Forth()(program), str)
+
+
+def test_tokenizer():
+    forth = Forth()
+
+    assert forth.sos_eos_id == 0
+    assert forth.num_tokens == len(forth.alphabet) + 1
+    assert forth.decode([forth.sos_eos_id]) == ''
+
+    for program in ('1 2 + EMIT', '3 BEGIN DUP EMIT 1 - DUP 0= UNTIL', '65 emit bye'):
+        ids = forth.encode(program)
+        assert all(0 < i < forth.num_tokens for i in ids)
+        assert forth.decode(ids) == program
