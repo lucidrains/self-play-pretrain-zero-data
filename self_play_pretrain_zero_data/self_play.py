@@ -19,24 +19,16 @@ class SelfPlay(Module):
         self.learner = learner
         self.executor = executor
 
-    def execute(
+    def execute_program(
         self,
         programs: str | Iterable[str],
-        seed = None,
         **kwargs
     ) -> str | list[str]:
 
         if isinstance(programs, str):
-            assert not isinstance(seed, Iterable), 'seed must be a single int or None for a single program'
-            return self.executor(programs, seed = seed, **kwargs)
+            return self.executor(programs, **kwargs)
 
-        if isinstance(seed, Iterable):
-            return [self.executor(program, seed = s, **kwargs) for program, s in zip(programs, seed, strict = True)]
-
-        return [
-            self.executor(program, seed = (seed + i) if seed is not None else None, **kwargs)
-            for i, program in enumerate(programs)
-        ]
+        return [self.executor(program, **kwargs) for program in programs]
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError

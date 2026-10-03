@@ -25,17 +25,17 @@ classifiers=[
 ]
 
 dependencies = [
-    "einx>=0.3.0",
+    "einx>=0.4.0",
     "einops>=0.8.1",
     "jvp_flash_attention",
     "torch>=2.5",
-    "torch-einops-utils>=0.0.29",
+    "torch-einops-utils>=0.1.34",
     "x-transformers"
 ]
 
 [project.urls]
 Homepage = "https://pypi.org/project/self-play-pretrain-zero-data/"
-Repository = "https://github.com/lucidrains/self-play-pretrain-zero-data"
+Repository = "https://codeberg.org/lucidrains/self-play-pretrain-zero-data"
 
 [project.optional-dependencies]
 examples = []

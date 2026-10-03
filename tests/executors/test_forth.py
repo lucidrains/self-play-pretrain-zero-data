@@ -1,6 +1,6 @@
 import random
 
-from self_play_pretrain_zero_data import Forth
+from self_play_pretrain_zero_data.executors import Forth
 
 
 def test_literals_and_arithmetic():
