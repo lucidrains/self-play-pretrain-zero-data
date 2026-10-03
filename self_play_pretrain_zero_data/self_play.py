@@ -2,13 +2,15 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, arange
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm
+from torch.func import functional_call, jvp
 
-from einops import einsum
+from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
+from torch_einops_utils import masked_mean, tree_map_detach
 from torch_einops_utils.shape import shape, size
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -48,7 +50,7 @@ class Attention(Module):
         self.to_qkv = LinearNoBias(dim, dim_inner * 3)
         self.to_out = LinearNoBias(dim_inner, dim)
 
-        self.split_heads = Rearrange('b n (h d ) -> b h n d', h = heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
     def forward(
@@ -115,9 +117,11 @@ class Transformer(Module):
         depth,
         dim_head = 64,
         heads = 8,
-        ff_expansion = 4.
+        ff_expansion = 4.,
+        pad_id = -1
     ):
         super().__init__()
+        self.pad_id = pad_id
 
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.rotary_emb = RotaryEmbedding(dim_head)
@@ -137,23 +141,80 @@ class Transformer(Module):
             LinearNoBias(dim, num_tokens)
         )
 
+    def forward_with_jvp(
+        self,
+        ids,
+        tangent,
+        detach_params = True
+    ):
+
+        # params
+
+        params = dict(self.named_parameters())
+
+        if detach_params:
+            params = tree_map_detach(params)
+
+        # forward with functional call, returning per sequence loss, accounting for padding
+
+        def functional_forward(p):
+            loss, loss_mask = functional_call(self, p, (ids,), dict(return_loss = True, reduce_loss = False))
+            return masked_mean(loss, loss_mask, dim = -1)
+
+        return jvp(functional_forward, (params,), (tangent,))
+
     def forward(
         self,
-        ids
+        ids,
+        return_loss = False,
+        reduce_loss = False
     ):
         device = ids.device
 
+        if return_loss:
+            ids, labels = ids[:, :-1], ids[:, 1:]
+            ids = ids.masked_fill(ids == self.pad_id, 0)
+
+        # tokens
+
         tokens = self.token_emb(ids)
-        pos = torch.arange(size(ids, 'b [n]'), device = device)
+
+        # positions
+
+        pos = arange(size(ids, 'b [n]'), device = device)
 
         rotary_emb = self.rotary_emb(pos)
+
+        # attention layers
 
         for attn, ff in self.layers:
             tokens = attn(tokens, rotary_emb = rotary_emb) + tokens
             tokens = ff(tokens) + tokens
 
+        # logits
+
         logits = self.to_logits(tokens)
-        return logits
+
+        if not return_loss:
+            return logits
+
+        # next token loss
+
+        pad_id = self.pad_id
+
+        loss = F.cross_entropy(
+            rearrange(logits, 'b n v -> b v n'),
+            labels,
+            ignore_index = pad_id,
+            reduction = 'mean' if reduce_loss else 'none'
+        )
+
+        if reduce_loss:
+            return loss
+
+        loss_mask = labels != pad_id
+
+        return loss, loss_mask
 
 # classes
 

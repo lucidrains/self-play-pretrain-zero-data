@@ -9,6 +9,17 @@ def test_transformer():
 
     assert model(ids).shape == (1, 1024, 256)
 
+def test_forward_with_jvp():
+    model = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4)
+
+    ids = torch.randint(0, 256, (3, 17))
+
+    tangent = {k: torch.randn_like(p) for k, p in model.named_parameters()}
+
+    _, loss_tangent = model.forward_with_jvp(ids, tangent)
+
+    assert loss_tangent.shape == (3,)
+
 def test_self_play():
 
     brainfuck = Brainfuck()
