@@ -16,7 +16,9 @@ def test_forward_with_jvp():
 
     tangent = {k: torch.randn_like(p) for k, p in model.named_parameters()}
 
-    _, loss_tangent = model.forward_with_jvp(ids, tangent)
+    loss, loss_tangent = model.forward_with_jvp(ids, tangent, detach_params = False)
+
+    loss.backward()
 
     assert loss_tangent.shape == (3,)
 

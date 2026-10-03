@@ -145,7 +145,8 @@ class Transformer(Module):
         self,
         ids,
         tangent,
-        detach_params = True
+        detach_params = True,
+        detach_seq_loss_tangent = True
     ):
 
         # params
@@ -155,13 +156,26 @@ class Transformer(Module):
         if detach_params:
             params = tree_map_detach(params)
 
-        # forward with functional call, returning per sequence loss, accounting for padding
+        # forward with functional call, returning token mean loss and per sequence mean loss for the tangent (generator reward), accounting for padding
 
         def functional_forward(p):
             loss, loss_mask = functional_call(self, p, (ids,), dict(return_loss = True, reduce_loss = False))
-            return masked_mean(loss, loss_mask, dim = -1)
 
-        return jvp(functional_forward, (params,), (tangent,))
+            token_mean_loss = masked_mean(loss, loss_mask)
+            seq_mean_loss = masked_mean(loss, loss_mask, dim = -1)
+
+            return token_mean_loss, seq_mean_loss
+
+        # jvp
+
+        (token_loss, _), (_, seq_loss_tangent) = jvp(functional_forward, (params,), (tangent,))
+
+        # just detach by default, as it is used as rewards downstream
+
+        if detach_seq_loss_tangent:
+            seq_loss_tangent = seq_loss_tangent.detach()
+
+        return token_loss, seq_loss_tangent
 
     def forward(
         self,
@@ -169,11 +183,11 @@ class Transformer(Module):
         return_loss = False,
         reduce_loss = False
     ):
-        device = ids.device
+        pad_id, device = self.pad_id, ids.device
 
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]
-            ids = ids.masked_fill(ids == self.pad_id, 0)
+            ids = ids.masked_fill(ids == pad_id, 0)
 
         # tokens
 
@@ -199,8 +213,6 @@ class Transformer(Module):
             return logits
 
         # next token loss
-
-        pad_id = self.pad_id
 
         loss = F.cross_entropy(
             rearrange(logits, 'b n v -> b v n'),
