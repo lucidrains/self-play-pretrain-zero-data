@@ -2,10 +2,12 @@ import pytest
 import torch
 from torch.optim import AdamW, SGD
 
-from self_play_pretrain_zero_data import Brainfuck, SelfPlay
-from self_play_pretrain_zero_data.self_play import Transformer, exists
+from self_play_pretrain_zero_data import Brainfuck, Forth, SelfPlay
+from self_play_pretrain_zero_data.self_play import Transformer, exists, register_direction
 
-@pytest.mark.parametrize('sos_eos_id', (None, 0))
+param = pytest.mark.parametrize
+
+@param('sos_eos_id', (None, 0))
 def test_transformer(sos_eos_id):
     ids = torch.randint(0, 256, (1, 1024))
 
@@ -19,7 +21,7 @@ def test_transformer(sos_eos_id):
 
     assert loss.shape == loss_mask.shape == (1, 1023 + auto_sos)
 
-@pytest.mark.parametrize('sos_eos_id', (None, 0))
+@param('sos_eos_id', (None, 0))
 def test_forward_with_jvp(sos_eos_id):
     model = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4, sos_eos_id = sos_eos_id)
 
@@ -33,37 +35,29 @@ def test_forward_with_jvp(sos_eos_id):
 
     assert loss_tangent.shape == (3,)
 
-def makeshift_direction(param, state):
-    momentum = state.get('momentum_buffer')
-
-    if not exists(momentum):
-        return -torch.ones_like(param)
-
-    return -momentum
-
-@pytest.mark.parametrize('optimizer_type', (None, AdamW, SGD))
-def test_self_play(optimizer_type):
+@param('executor_type', (Brainfuck, Forth))
+@param('optimizer_type', (None, AdamW, SGD))
+def test_self_play(optimizer_type, executor_type):
     torch.manual_seed(0)
 
-    brainfuck = Brainfuck()
+    executor = executor_type()
 
-    generator = Transformer(num_tokens = brainfuck.num_tokens, dim = 64, depth = 2, dim_head = 16, heads = 4, sos_eos_id = brainfuck.sos_eos_id)
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 64, depth = 2, dim_head = 16, heads = 4, sos_eos_id = executor.sos_eos_id)
     learner = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4)
+
+    # sgd has no state to derive a direction from, so just register a constant one
+
+    register_direction(SGD, lambda param, state: -torch.ones_like(param))
 
     # passing none uses the default learner optimizer, default learner tokenizer and default learner direction
 
-    learner_optimizer, learner_direction_fn = None, None
-
-    if exists(optimizer_type):
-        learner_optimizer = optimizer_type(learner.parameters(), lr = 3e-4)
-        learner_direction_fn = None if optimizer_type is AdamW else makeshift_direction
+    learner_optimizer = optimizer_type(learner.parameters(), lr = 3e-4) if exists(optimizer_type) else None
 
     self_play = SelfPlay(
         generator = generator,
         learner = learner,
-        executor = brainfuck,
-        learner_optimizer = learner_optimizer,
-        learner_direction_fn = learner_direction_fn
+        executor = executor,
+        learner_optimizer = learner_optimizer
     )
 
     # generator samples programs, executes them, and the learner takes a step on the encoded outputs

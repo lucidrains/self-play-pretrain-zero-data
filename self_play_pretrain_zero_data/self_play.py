@@ -407,6 +407,9 @@ DIRECTION_FNS = {
     AdamW: adam_direction
 }
 
+def register_direction(optimizer_type, direction_fn):
+    DIRECTION_FNS[optimizer_type] = direction_fn
+
 # classes
 
 class SelfPlay(Module):
