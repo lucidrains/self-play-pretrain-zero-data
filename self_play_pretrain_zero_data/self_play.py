@@ -275,20 +275,28 @@ class Transformer(Module):
 
         return [decode_fn(ids) for ids in out.tolist()]
 
+    def trainable_parameter_names(self):
+        return {name for name, param in self.named_parameters() if param.requires_grad}
+
     def forward_with_jvp(
         self,
         ids,
         tangent,
-        detach_params = True,
         detach_seq_loss_tangent = True
     ):
 
-        # params
+        # only gradient requiring parameters participate
+        # params always detached, as only the loss tangent is needed, the learner takes its own step
 
-        params = dict(self.named_parameters())
+        trainable_names = self.trainable_parameter_names()
 
-        if detach_params:
-            params = tree_map_detach(params)
+        params = tree_map_detach({
+            name: param
+            for name, param in self.named_parameters()
+            if name in trainable_names
+        })
+
+        tangent = {name: t for name, t in tangent.items() if name in trainable_names}
 
         # forward with functional call, returning token mean loss and per sequence mean loss for the tangent (generator reward), accounting for padding
 
@@ -416,16 +424,13 @@ def default_lookback_epoch_fn(epoch):
 # P = lr / (sqrt(v_hat) + eps)
 
 def adam_preconditioning(param, state, param_group):
-    lr = param_group.get('lr', 1e-3)
-    eps = param_group.get('eps', 1e-8)
-    _, beta2 = param_group.get('betas', (0.9, 0.999))
+    lr = param_group['lr']
+    eps = param_group['eps']
+    _, beta2 = param_group['betas']
 
-    exp_avg_sq = state.get('exp_avg_sq')
+    exp_avg_sq = state['exp_avg_sq']
 
-    if not exists(exp_avg_sq):
-        return torch.full_like(param, lr / eps)
-
-    step = state.get('step', 0)
+    step = state['step']
     step = step.item() if is_tensor(step) else step
 
     v_hat = exp_avg_sq / (1 - beta2 ** step) if step > 0 else exp_avg_sq
@@ -527,9 +532,12 @@ class SelfPlay(Module):
 
         past_params = self.load_checkpoint(epoch, strict = strict)
 
+        trainable_names = self.learner.trainable_parameter_names()
+
         return {
             name: (past_params[name].to(param) - param).detach()
             for name, param in self.learner.named_parameters()
+            if name in trainable_names
         }
 
     @property
@@ -546,6 +554,9 @@ class SelfPlay(Module):
         preconditioning = dict()
 
         for name, param in self.learner.named_parameters():
+            if not param.requires_grad:
+                continue
+
             param_group = param_groups.get(id(param), dict())
             state = self.learner_optimizer.state.get(param, dict())
             preconditioning[name] = preconditioning_fn(param, state, param_group)
