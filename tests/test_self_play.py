@@ -2,28 +2,41 @@ import pytest
 import torch
 from torch.optim import AdamW, SGD
 
-from self_play_pretrain_zero_data import Brainfuck, Forth, SelfPlay
-from self_play_pretrain_zero_data.self_play import Transformer, exists, register_preconditioning
+from self_play_pretrain_zero_data import Brainfuck, Executor, Forth, SelfPlay
+from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning
 
 param = pytest.mark.parametrize
 
-@param('sos_eos_id', (None, 0))
-def test_transformer(sos_eos_id):
+def test_transformer():
     ids = torch.randint(0, 256, (1, 1024))
 
-    model = Transformer(num_tokens = 256, dim = 512, depth = 6, sos_eos_id = sos_eos_id)
+    model = Transformer(num_tokens = 256, dim = 512, depth = 6)
 
-    auto_sos = int(sos_eos_id is not None)
-
-    assert model(ids).shape == (1, 1024 + auto_sos, 256)
+    assert model(ids).shape == (1, 1024, 256)
 
     loss, loss_mask = model(ids, return_loss = True)
 
-    assert loss.shape == loss_mask.shape == (1, 1023 + auto_sos)
+    assert loss.shape == loss_mask.shape == (1, 1023)
 
-@param('sos_eos_id', (None, 0))
-def test_forward_with_jvp(sos_eos_id):
-    model = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4, sos_eos_id = sos_eos_id)
+def test_empty_output_gets_eos_target():
+    model = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
+
+    strings = ['', 'AB', chr(255)]
+    ids = char_encode(strings)
+
+    _, loss_mask = model(ids, return_loss = True)
+
+    assert loss_mask[0, 0]
+    assert not loss_mask[0, 1:].any()
+
+    reduced_loss = model(ids, return_loss = True, reduce_loss = True)
+
+    assert torch.isfinite(reduced_loss)
+
+    assert [char_decode(row) for row in ids] == strings
+
+def test_forward_with_jvp():
+    model = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4)
 
     ids = torch.randint(0, 256, (3, 17))
 
@@ -34,6 +47,35 @@ def test_forward_with_jvp(sos_eos_id):
     assert loss.shape == ()
     assert loss_tangent.shape == (3,)
 
+class EmptyExecutor(Executor):
+    num_tokens = 3
+
+    def encode(self, program):
+        return []
+
+    def decode(self, ids):
+        return ''
+
+    def __call__(self, program, input = '', seed = None):
+        return ''
+
+def test_self_play_handles_empty_outputs(tmp_path):
+    torch.manual_seed(0)
+
+    executor = EmptyExecutor()
+
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2)
+    learner = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
+
+    self_play = SelfPlay(generator = generator, learner = learner, executor = executor, learner_checkpoint_folder = tmp_path)
+
+    losses, tangents = self_play(batch_size = 2, max_length = 4, verbose = False, num_epochs = 2, decode_fn = executor.decode)
+
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(tangents).all()
+    assert (losses > 0).all()
+    assert (tangents != 0).any()
+
 @param('executor_type', (Brainfuck, Forth))
 @param('optimizer_type', (None, AdamW, SGD))
 def test_self_play(optimizer_type, executor_type, tmp_path):
@@ -41,8 +83,8 @@ def test_self_play(optimizer_type, executor_type, tmp_path):
 
     executor = executor_type()
 
-    generator = Transformer(num_tokens = executor.num_tokens, dim = 32, depth = 1, dim_head = 8, heads = 4, sos_eos_id = executor.sos_eos_id)
-    learner = Transformer(num_tokens = 256, dim = 32, depth = 1, dim_head = 8, heads = 4)
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 32, depth = 1, dim_head = 8, heads = 4)
+    learner = Transformer(num_tokens = 256 + 1, dim = 32, depth = 1, dim_head = 8, heads = 4)
 
     # sgd has no state to derive a preconditioner from, so just register a constant one
 

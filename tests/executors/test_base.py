@@ -41,8 +41,8 @@ def test_bct():
 def test_self_play_accepts_contrived_executor(tmp_path):
     executor = BCT()
 
-    generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2, sos_eos_id = executor.sos_eos_id)
-    learner = Transformer(num_tokens = 256, dim = 16, depth = 1, dim_head = 8, heads = 2)
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2)
+    learner = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
 
     self_play = SelfPlay(generator = generator, learner = learner, executor = executor, learner_checkpoint_folder = tmp_path)
 

@@ -163,17 +163,14 @@ class Transformer(Module):
         dim_head = 64,
         heads = 8,
         ff_expansion = 4.,
-        pad_id = -1,
-        sos_eos_id = None
+        pad_id = -1
     ):
         super().__init__()
-        assert not exists(sos_eos_id) or 0 <= sos_eos_id < num_tokens
 
         # embedding
 
         self.num_tokens = num_tokens
         self.pad_id = pad_id
-        self.sos_eos_id = sos_eos_id
 
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.rotary_emb = RotaryEmbedding(dim_head)
@@ -209,15 +206,12 @@ class Transformer(Module):
         temperature = 1.,
         filter_logits_fn = top_k,
         filter_thres = 0.9,
-        eos_id = None,
+        eos_id = 0,
         pad_value = None,
         decode_fn = None,
         mask_out_eos_on_first_step = True
     ):
-        eos_id = default(eos_id, self.sos_eos_id)
         pad_value = default(pad_value, eos_id)
-
-        assert exists(eos_id), 'an eos id must be given on init or passed into generate'
 
         device = self.dummy.device
 
@@ -235,7 +229,10 @@ class Transformer(Module):
 
         batch_size, prompt_len = shape(prompt_ids, 'b n')
 
-        ids = out = prompt_ids
+        start_ids = full((batch_size, 1), 0, dtype = torch.long, device = device)
+        ids = out = cat((start_ids, prompt_ids), dim = -1)
+        prompt_len += 1
+
         memory = None
 
         # sample until every sequence has emitted eos
@@ -327,12 +324,7 @@ class Transformer(Module):
         return_memory = False,
         reduce_loss = False
     ):
-        batch = size(ids, '[b] n')
         has_memory = exists(memory)
-
-        # auto prepend sos / eos token id (0) at position 0, only when no memory is passed in
-
-        auto_sos = exists(self.sos_eos_id) and not has_memory
 
         assert not (has_memory and return_loss), 'return loss cannot be turned on when a memory is passed in'
 
@@ -346,16 +338,12 @@ class Transformer(Module):
         pad_id, device = self.pad_id, ids.device
 
         if return_loss:
-            ids, labels = (ids, ids) if auto_sos else (ids[:, :-1], ids[:, 1:])
-            ids = ids.masked_fill(ids == pad_id, default(self.sos_eos_id, 0))
+            ids, labels = ids[:, :-1], ids[:, 1:]
+            ids = ids.masked_fill(ids == pad_id, 0)
 
         # tokens
 
         tokens = self.token_emb(ids)
-
-        if auto_sos:
-            sos_ids = full((batch, 1), self.sos_eos_id, dtype = torch.long, device = device)
-            tokens = cat((self.token_emb(sos_ids), tokens), dim = -2)
 
         seq_len = size(tokens, 'b [n] d')
 
@@ -388,32 +376,38 @@ class Transformer(Module):
 
             return logits, (tokens_seen + seq_len, next_memories)
 
-        # next token loss, dropping the extra logit produced by the auto sos token
-
-        if auto_sos:
-            logits = logits[:, :-1]
-
         loss = F.cross_entropy(
             rearrange(logits, 'b n v -> b v n'),
             labels,
             ignore_index = pad_id,
-            reduction = 'none'
+            reduction = 'mean' if reduce_loss else 'none'
         )
 
-        loss_mask = labels != pad_id
-
         if reduce_loss:
-            return masked_mean(loss, loss_mask)
+            return loss
+
+        loss_mask = labels != pad_id
 
         return loss, loss_mask
 
 # default learner tokenizer
 
-def char_encode(strings):
+def char_encode(strings, add_zero_sos_eos_id = True):
+    offset = int(add_zero_sos_eos_id)
+    zero_sos_eos = [0] * offset
+
     return pad_sequence(
-        [tensor([ord(c) for c in string], dtype = torch.long) for string in strings],
+        [tensor(zero_sos_eos + [ord(c) + offset for c in string] + zero_sos_eos, dtype = torch.long) for string in strings],
         value = -1
     )
+
+def char_decode(ids, add_zero_sos_eos_id = True):
+    ids = ids.tolist() if is_tensor(ids) else ids
+
+    offset = int(add_zero_sos_eos_id)
+    special_ids = {0, -1} if add_zero_sos_eos_id else {-1}
+
+    return ''.join(chr(i - offset) for i in ids if i not in special_ids)
 
 # default learner lookback - the checkpoint from half of the epochs ago
 
@@ -463,10 +457,9 @@ class SelfPlay(Module):
     ):
         super().__init__()
 
-        # the generator transformer must be initialized with auto sos / eos
+        # generator and executor must share the same vocabulary size
 
         if isinstance(generator, Transformer):
-            assert exists(generator.sos_eos_id), 'generator transformer must have the auto sos / eos id turned on'
             assert generator.num_tokens == executor.num_tokens, 'generator and executor must share the same vocabulary size'
 
         self.generator = generator
