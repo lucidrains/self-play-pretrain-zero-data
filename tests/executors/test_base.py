@@ -1,6 +1,6 @@
 import torch
 
-from self_play_pretrain_zero_data import Executor, SelfPlay
+from self_play_pretrain_zero_data import CheckpointReference, Executor, SelfPlay
 from self_play_pretrain_zero_data.self_play import Transformer
 
 class BCT(Executor):
@@ -44,7 +44,12 @@ def test_self_play_accepts_contrived_executor(tmp_path):
     generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2)
     learner = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
 
-    self_play = SelfPlay(generator = generator, learner = learner, executor = executor, learner_checkpoint_folder = tmp_path)
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        learner_reference = CheckpointReference(folder = tmp_path)
+    )
 
     loss, tangent = self_play(batch_size = 2, max_length = 4, verbose = False, decode_fn = executor.decode)
 

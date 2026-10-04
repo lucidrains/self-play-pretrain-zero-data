@@ -17,6 +17,8 @@ from torch.func import functional_call, jvp
 
 from accelerate import Accelerator
 
+from ema_pytorch import EMA
+
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
@@ -505,10 +507,99 @@ PRECONDITIONING_FNS = {
 def register_preconditioning(optimizer_type, preconditioning_fn):
     PRECONDITIONING_FNS[optimizer_type] = preconditioning_fn
 
-# default learner lookback - the checkpoint from half the epochs ago
+# learner reference - tracks past learner parameters for the reward tangent
+
+class LearnerReference(Module):
+    def update(self, learner, step):
+        # ingest the learner parameters after a step
+        raise NotImplementedError
+
+    def reference_params(self, learner, step):
+        # reference parameters the difference is derived against
+        raise NotImplementedError
+
+    def difference(self, learner, step):
+        # reference minus current learner parameters
+
+        reference_params = self.reference_params(learner, step)
+
+        return {
+            name: (reference_params[name].to(param) - param).detach()
+            for name, param in learner.named_parameters()
+            if name in reference_params and param.requires_grad
+        }
+
+# learner reference - checkpoint lookback
 
 def default_lookback_epoch_fn(epoch):
     return epoch // 2
+
+class CheckpointReference(LearnerReference):
+    def __init__(
+        self,
+        folder = 'learner_checkpoints',
+        lookback_epoch_fn = None,
+        strict = True
+    ):
+        super().__init__()
+
+        self.folder = Path(folder)
+        self.folder.mkdir(parents = True, exist_ok = True)
+
+        self.lookback_epoch_fn = default(lookback_epoch_fn, default_lookback_epoch_fn)
+        self.strict = strict
+
+    def checkpoint_path(self, epoch):
+        return self.folder / f'learner.{int(epoch)}.pt'
+
+    def nearest_checkpoint_epoch(self, epoch):
+        checkpoint_epochs = sorted(int(path.stem.split('.')[-1]) for path in self.folder.glob('learner.*.pt'))
+        assert len(checkpoint_epochs) > 0, f'no learner checkpoints found in {self.folder}'
+        return min(checkpoint_epochs, key = lambda e: abs(e - epoch))
+
+    @torch.no_grad()
+    def update(self, learner, step):
+        torch.save(learner.state_dict(), self.checkpoint_path(step))
+
+    def reference_params(self, learner, step):
+        # learner parameters at the lookback epoch
+
+        lookback = self.lookback_epoch_fn(step)
+
+        if not self.strict:
+            lookback = self.nearest_checkpoint_epoch(lookback)
+
+        path = self.checkpoint_path(lookback)
+        assert path.exists(), f'no learner checkpoint found at {path}'
+
+        return torch.load(path, map_location = 'cpu', weights_only = True)
+
+# learner reference - exponential moving average
+
+class EMAReference(LearnerReference):
+    def __init__(self, decay = 0.99):
+        super().__init__()
+
+        self.decay = decay
+        self.ema = None
+
+    @torch.no_grad()
+    def update(self, learner, step):
+        if not exists(self.ema):
+            self.ema = EMA(
+                learner,
+                beta = self.decay,
+                update_after_step = 0,
+                update_every = 1,
+                include_online_model = False
+            )
+
+        self.ema.update()
+
+    def reference_params(self, learner, step):
+        assert exists(self.ema), 'ema reference has not been initialized'
+
+        return dict(self.ema.ema_model.named_parameters())
 
 # classes
 
@@ -530,9 +621,7 @@ class SelfPlay(Module):
         generator_lr = 3e-4,
         generator_weight_decay = 0.01,
         generator_max_grad_norm = 1.,
-        learner_checkpoint_folder = 'learner_checkpoints',
-        learner_lookback_epoch_fn = None,
-        learner_checkpoint_strict = True
+        learner_reference = None
     ):
         super().__init__()
 
@@ -574,20 +663,6 @@ class SelfPlay(Module):
 
         self.learner_preconditioning_fn = default(learner_preconditioning_fn, PRECONDITIONING_FNS.get(type(learner_optimizer)))
 
-        # persistent epoch counter
-
-        self.register_buffer('epoch', tensor(0, dtype = torch.long))
-
-        # learner checkpoints, used to derive parameter differences over the lookback window
-
-        self.learner_checkpoint_folder = Path(learner_checkpoint_folder)
-        self.learner_checkpoint_folder.mkdir(parents = True, exist_ok = True)
-
-        # lookback checkpoint selection for the generator reward
-
-        self.learner_lookback_epoch_fn = default(learner_lookback_epoch_fn, default_lookback_epoch_fn)
-        self.learner_checkpoint_strict = learner_checkpoint_strict
-
         # generator prior for the kl, uniform by default
 
         self.generator_prior = None
@@ -606,7 +681,20 @@ class SelfPlay(Module):
             learner_optimizer
         )
 
-        self.save_checkpoint()
+        # reference learner parameters the generator reward is derived against, checkpoint lookback by default
+
+        if not exists(learner_reference):
+            learner_reference = CheckpointReference()
+
+        self.learner_reference = learner_reference
+
+        # persistent step counter shared with the learner reference
+
+        self.register_buffer('epoch', tensor(0, dtype = torch.long))
+
+        # seed the reference with the initial learner parameters
+
+        self.learner_reference.update(self.unwrapped_learner, self.epoch.item())
 
     @property
     def device(self):
@@ -620,42 +708,10 @@ class SelfPlay(Module):
     def unwrapped_learner(self):
         return self.accelerator.unwrap_model(self.learner)
 
-    def checkpoint_path(self, epoch):
-        return self.learner_checkpoint_folder / f'learner.{int(epoch)}.pt'
+    def parameter_difference(self):
+        # reference minus current learner parameters
 
-    def nearest_checkpoint_epoch(self, epoch):
-        checkpoint_epochs = sorted(int(path.stem.split('.')[-1]) for path in self.learner_checkpoint_folder.glob('learner.*.pt'))
-        assert len(checkpoint_epochs) > 0, f'no learner checkpoints found in {self.learner_checkpoint_folder}'
-        return min(checkpoint_epochs, key = lambda e: abs(e - epoch))
-
-    def save_checkpoint(self, epoch = None):
-        epoch = default(epoch, self.epoch.item())
-        torch.save(self.unwrapped_learner.state_dict(), self.checkpoint_path(epoch))
-
-    def load_checkpoint(self, epoch, strict = None):
-        # strict fails on a missing checkpoint, else the nearest one is used
-
-        if not default(strict, self.learner_checkpoint_strict):
-            epoch = self.nearest_checkpoint_epoch(epoch)
-
-        path = self.checkpoint_path(epoch)
-        assert path.exists(), f'no learner checkpoint found at {path}'
-
-        return torch.load(path, map_location = 'cpu', weights_only = True)
-
-    def parameter_difference(self, epoch, strict = None):
-        # learner parameter difference over the lookback window, past minus current
-
-        past_params = self.load_checkpoint(epoch, strict = strict)
-
-        learner = self.unwrapped_learner
-        trainable_names = learner.trainable_parameter_names()
-
-        return {
-            name: (past_params[name].to(param) - param).detach()
-            for name, param in learner.named_parameters()
-            if name in trainable_names
-        }
+        return self.learner_reference.difference(self.unwrapped_learner, self.epoch.item())
 
     @property
     def learner_preconditioning(self):
@@ -682,10 +738,10 @@ class SelfPlay(Module):
 
         return preconditioning
 
-    def preconditioned_parameter_difference(self, epoch, strict = None):
-        # preconditioned lookback tangent, i.e. the generator reward
+    def preconditioned_parameter_difference(self):
+        # preconditioned reference difference, i.e. the generator reward
 
-        difference = self.parameter_difference(epoch, strict = strict)
+        difference = self.parameter_difference()
         preconditioning = self.learner_preconditioning
 
         return {name: preconditioning[name] * diff for name, diff in difference.items()}
@@ -835,16 +891,14 @@ class SelfPlay(Module):
             self.learner_optimizer.step()
             self.learner_optimizer.zero_grad()
 
-            # advance epoch, checkpoint the learner
+            # advance step, fold the learner step into the reference
 
             self.epoch.add_(1)
-            self.save_checkpoint()
+            self.learner_reference.update(learner, self.epoch.item())
 
-            # preconditioned lookback tangent, used as the generator reward
+            # preconditioned difference to the reference, used as the generator reward
 
-            lookback_checkpoint = self.learner_lookback_epoch_fn(self.epoch.item())
-
-            tangent = self.preconditioned_parameter_difference(lookback_checkpoint)
+            tangent = self.preconditioned_parameter_difference()
 
             _, loss_tangent = learner.forward_with_jvp(ids, tangent)
 

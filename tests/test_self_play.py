@@ -2,10 +2,17 @@ import pytest
 import torch
 from torch.optim import AdamW, SGD
 
-from self_play_pretrain_zero_data import Brainfuck, Executor, Forth, SelfPlay
+from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, SelfPlay
 from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning
 
 param = pytest.mark.parametrize
+
+# swap this single param to test a different learner reference end to end
+
+reference_fns = {
+    'checkpoint': lambda tmp_path: CheckpointReference(folder = tmp_path),
+    'ema': lambda _: EMAReference(decay = 0.99)
+}
 
 def test_transformer():
     ids = torch.randint(0, 256, (1, 1024))
@@ -67,7 +74,12 @@ def test_self_play_handles_empty_outputs(tmp_path):
     generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2)
     learner = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
 
-    self_play = SelfPlay(generator = generator, learner = learner, executor = executor, learner_checkpoint_folder = tmp_path)
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        learner_reference = CheckpointReference(folder = tmp_path)
+    )
 
     losses, tangents = self_play(batch_size = 2, max_length = 4, verbose = False, epochs = 2, decode_fn = executor.decode)
 
@@ -88,9 +100,10 @@ def test_generate_seq_mask_matches_derived_mask():
 
     assert (derived == info.seq_mask).all()
 
+@param('reference_fn', reference_fns.values(), ids = reference_fns.keys())
 @param('executor_type', (Brainfuck, Forth))
 @param('optimizer_type', (None, AdamW, SGD))
-def test_self_play(optimizer_type, executor_type, tmp_path):
+def test_self_play(reference_fn, optimizer_type, executor_type, tmp_path):
     torch.manual_seed(0)
 
     executor = executor_type()
@@ -111,7 +124,7 @@ def test_self_play(optimizer_type, executor_type, tmp_path):
         learner = learner,
         executor = executor,
         learner_optimizer = learner_optimizer,
-        learner_checkpoint_folder = tmp_path
+        learner_reference = reference_fn(tmp_path)
     )
 
     # generator samples programs, executes them, and the learner takes four steps on the encoded outputs
@@ -124,14 +137,15 @@ def test_self_play(optimizer_type, executor_type, tmp_path):
     assert losses.shape == (num_epochs,)
     assert tangents.shape == (num_epochs, 2)
 
-    # initial checkpoint plus one per epoch
+    # the checkpoint reference persists an initial checkpoint plus one per epoch
 
-    for epoch in range(num_epochs + 1):
-        assert (tmp_path / f'learner.{epoch}.pt').exists()
+    if isinstance(self_play.learner_reference, CheckpointReference):
+        for epoch in range(num_epochs + 1):
+            assert (tmp_path / f'learner.{epoch}.pt').exists()
 
-    # parameter difference against the initial checkpoint, and preconditioning for every gradient requiring learner parameter
+    # parameter difference against the reference, and preconditioning for every gradient requiring learner parameter
 
-    difference = self_play.parameter_difference(0)
+    difference = self_play.parameter_difference()
 
     assert difference.keys() == learner.trainable_parameter_names()
 
