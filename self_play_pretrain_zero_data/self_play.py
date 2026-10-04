@@ -23,6 +23,7 @@ from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import batched_index_select, clamp, lens_to_mask, masked_mean, masked_sum, pack_with_inverse, pad_left_at_dim, pad_sequence, temp_eval, tree_map_detach, z_score
+from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.shape import shape, size
 from torch_einops_utils.torch_einops_utils import identity
 
@@ -823,6 +824,7 @@ class SelfPlay(Module):
 
         return -lens * math.log(generator.num_tokens)
 
+    @move_inputs_to_module_device
     def grpo_loss(
         self,
         rewards,         # (b)
@@ -832,6 +834,7 @@ class SelfPlay(Module):
         prompt_len = 1,  # 1 for start token
         log_ratio_clamp = (-20., 20.),
         length_normalize = False,
+        length_normalize_kl = False,
         seq_mask = None,
         kl_loss_weight = 1.,
         prior_generator = None,
@@ -856,16 +859,19 @@ class SelfPlay(Module):
 
         prior_log_probs = self.prior_log_probs(replay_ids, seq_mask, prior_generator = prior_generator)
 
+        seq_lens = seq_mask.sum(dim = -1).clamp_min(1.)
+
         normed_rewards = z_score(rewards)
         kl_to_prior = (log_probs - prior_log_probs).detach()
+
+        if length_normalize_kl:
+            kl_to_prior = kl_to_prior / seq_lens
 
         advantages = normed_rewards - kl_loss_weight * kl_to_prior
 
         # sequence importance ratio
 
-        ratio_mult = 1.
-        if length_normalize:
-            ratio_mult = seq_mask.sum(dim = -1).clamp_min(1.) ** -1.
+        ratio_mult = seq_lens ** -1. if length_normalize else 1.
 
         ratio = (log_probs - old_log_probs).mul(ratio_mult).clamp(*log_ratio_clamp).exp()
 
