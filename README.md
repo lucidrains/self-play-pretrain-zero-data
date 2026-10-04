@@ -6,6 +6,23 @@ Implementation of [Self-Play Pretraining with Zero Data](https://arxiv.org/abs/2
 
 [Paper Review from @hu-po](https://www.youtube.com/watch?v=mGMiiPpWBSo)
 
+## Usage
+
+```python
+import torch
+from self_play_pretrain_zero_data import Brainfuck, SelfPlay, Transformer
+
+executor = Brainfuck()
+
+generator = Transformer(num_tokens = executor.num_tokens, dim = 512, depth = 6)
+learner = Transformer(num_tokens = 256 + 1, dim = 512, depth = 6)
+
+self_play = SelfPlay(generator, learner, executor)
+self_play(epochs = 10)
+
+torch.save(learner.state_dict(), './learner.pt')
+```
+
 ## Citations
 
 ```bibtex

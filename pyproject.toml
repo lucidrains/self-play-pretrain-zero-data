@@ -1,6 +1,6 @@
 [project]
 name = "self-play-pretrain-zero-data"
-version = "0.0.10"
+version = "0.0.11"
 description = "Implementation of Self-Play Pretraining with Zero Data"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,7 +30,7 @@ dependencies = [
     "jvp_flash_attention",
     "rotary-embedding-torch",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.34",
+    "torch-einops-utils>=0.1.35",
     "x-transformers"
 ]
 

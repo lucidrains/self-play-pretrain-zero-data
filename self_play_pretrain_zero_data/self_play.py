@@ -1,19 +1,25 @@
 from __future__ import annotations
+from types import SimpleNamespace
+from copy import deepcopy
+
 from functools import partial
 from math import ceil
 from pathlib import Path
 
+import math
+
 import torch
 import torch.nn.functional as F
-from torch import nn, arange, cat, stack, full, tensor, is_tensor
+from torch import nn, arange, cat, isin, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam, AdamW
 from torch.func import functional_call, jvp
 
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import clamp, mask_after, masked_mean, pack_with_inverse, pad_sequence, temp_eval, tree_map_detach
+from torch_einops_utils import batched_index_select, clamp, lens_to_mask, masked_mean, masked_sum, pack_with_inverse, pad_left_at_dim, pad_sequence, temp_eval, tree_map_detach, z_score
 from torch_einops_utils.shape import shape, size
 from torch_einops_utils.torch_einops_utils import identity
 
@@ -32,6 +38,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def pick(d, keys):
+    return tuple(d[key] for key in keys)
 
 # sampling helpers
 
@@ -196,6 +205,9 @@ class Transformer(Module):
 
         self.register_buffer('dummy', tensor(0), persistent = False)
 
+    def trainable_parameter_names(self):
+        return {name for name, param in self.named_parameters() if param.requires_grad}
+
     @torch.no_grad()
     @temp_eval
     def generate(
@@ -203,48 +215,73 @@ class Transformer(Module):
         batch_size = 1,
         max_length = 256,
         prompt_ids = None,
+        prepend_sos = None,
         temperature = 1.,
         filter_logits_fn = top_k,
         filter_thres = 0.9,
-        eos_id = 0,
+        sos_id = 0,
+        eos_ids = (0,),
         pad_value = None,
         decode_fn = None,
-        mask_out_eos_on_first_step = True
+        mask_out_eos_on_first_step = True,
+        return_for_policy_optimization = False
     ):
-        pad_value = default(pad_value, eos_id)
+        pad_value = default(pad_value, self.pad_id)
+        prepend_sos = default(prepend_sos, not exists(prompt_ids))
 
         device = self.dummy.device
 
-        # a prompt is optional, as the auto prepended sos id (0) serves as one
-        # pack any leading batch dims, to be restored at the end
+        termination_ids = tensor(eos_ids, device = device)
+
+        # a prompt is optional, sos prepended when absent - pack leading batch dims
 
         if exists(prompt_ids):
             prompt_ids = torch.as_tensor(prompt_ids, dtype = torch.long, device = device)
             prompt_ids, unpack = pack_with_inverse(prompt_ids, '* n')
         else:
+            assert prepend_sos, 'sos must be prepended if no prompt is given'
+
             prompt_ids = torch.empty((batch_size, 0), dtype = torch.long, device = device)
             unpack = identity
 
-        # one prompt per batch, may be variable length - derive batch size and prompt length
+        # one prompt per batch, may be variable length
 
-        batch_size, prompt_len = shape(prompt_ids, 'b n')
+        _, prompt_len = shape(prompt_ids, 'b n')
 
-        start_ids = full((batch_size, 1), 0, dtype = torch.long, device = device)
-        ids = out = cat((start_ids, prompt_ids), dim = -1)
-        prompt_len += 1
+        # optionally seed with a start token
+
+        out = prompt_ids
+
+        if prepend_sos:
+            out = pad_left_at_dim(prompt_ids, 1, dim = -1, value = sos_id)
+            prompt_len += 1
+
+        ids = out
+
+        # log probs, seeded zero width in case no steps are taken
+
+        log_probs = [out[..., :0].float()]
 
         memory = None
 
-        # sample until every sequence has emitted eos
+        # sample until every sequence has terminated
 
         for step in range(max_length):
+            is_first_step = step == 0
+
             logits, memory = self.forward(ids, memory = memory, return_memory = True)
             logits = logits[:, -1:]
 
-            # on the very first step, mask out the sos / eos id so generation cannot immediately terminate
+            # policy log probs from unfiltered logits, matching replay
 
-            if mask_out_eos_on_first_step and step == 0:
-                logits = logits.masked_fill(arange(self.num_tokens, device = device) == eos_id, -torch.finfo(logits.dtype).max)
+            policy_logits = logits
+
+            # cannot immediately terminate on first step
+
+            if mask_out_eos_on_first_step and is_first_step:
+                termination_mask = isin(arange(self.num_tokens, device = device), termination_ids)
+
+                logits = logits.masked_fill(termination_mask, -torch.finfo(logits.dtype).max)
 
             # filter and sample
 
@@ -254,26 +291,63 @@ class Transformer(Module):
             ids = sample
             out = cat((out, sample), dim = -1)
 
-            # exit if all eos
+            # get log probs
 
-            if (out == eos_id).any(dim = -1).all():
+            if return_for_policy_optimization:
+                log_prob = batched_index_select(policy_logits.log_softmax(dim = -1), sample, dim = -1)
+
+                log_probs.append(log_prob)
+
+            # exit if all terminated - generated region only, as sos / eos id is shared
+
+            if isin(out[:, prompt_len:], termination_ids).any(dim = -1).all():
                 break
 
-        # mask out everything after the first eos, leaving sequences that never emitted eos untouched
+        # mask first terminator and after, generated region only
 
-        out = out.masked_fill(~mask_after(out, eos_id, inclusive = True), pad_value)
+        generated = out[:, prompt_len:]
 
-        out = unpack(out[:, prompt_len:])
+        terminated = isin(generated, termination_ids).cumsum(dim = -1) > 0
 
-        # maybe decode the sampled ids into programs
+        generated.masked_fill_(terminated, pad_value)
 
-        if not exists(decode_fn):
+        # generated lengths, excluding the terminator
+
+        gen_lens = (~terminated).sum(dim = -1)
+
+        seq_mask = pad_left_at_dim(lens_to_mask(gen_lens, max_len = size(out, '... [n]') - prompt_len), prompt_len)
+
+        # restore leading batch dims
+
+        out = unpack(out)
+        seq_mask = unpack(seq_mask)
+
+        program_ids = out
+
+        # remove the prompt
+
+        out = out[:, prompt_len:]
+
+        # decode
+
+        if exists(decode_fn):
+            out = [decode_fn(ids) for ids in out.tolist()]
+
+        if not return_for_policy_optimization:
             return out
 
-        return [decode_fn(ids) for ids in out.tolist()]
+        # old log probs, aligned with the full replayed sequence - pad, then unpack
 
-    def trainable_parameter_names(self):
-        return {name for name, param in self.named_parameters() if param.requires_grad}
+        old_log_probs = unpack(pad_left_at_dim(cat(log_probs, dim = -1), prompt_len))
+
+        policy_opt_return = SimpleNamespace(
+            prompt_len = prompt_len,
+            decoded_ids = program_ids,
+            old_log_probs = old_log_probs,
+            seq_mask = seq_mask,
+        )
+
+        return out, policy_opt_return
 
     def forward_with_jvp(
         self,
@@ -339,7 +413,8 @@ class Transformer(Module):
 
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]
-            ids = ids.masked_fill(ids == pad_id, 0)
+
+        ids = ids.masked_fill(ids == pad_id, 0)
 
         # tokens
 
@@ -409,22 +484,12 @@ def char_decode(ids, add_zero_sos_eos_id = True):
 
     return ''.join(chr(i - offset) for i in ids if i not in special_ids)
 
-# default learner lookback - the checkpoint from half of the epochs ago
-
-def default_lookback_epoch_fn(epoch):
-    return epoch // 2
-
-# default learner preconditioning - the diagonal AdamW step operator from the paper
-# P = lr / (sqrt(v_hat) + eps)
+# default learner preconditioning - the diagonal AdamW step operator
 
 def adam_preconditioning(param, state, param_group):
-    lr = param_group['lr']
-    eps = param_group['eps']
-    _, beta2 = param_group['betas']
+    lr, eps, (_, beta2) = pick(param_group, ('lr', 'eps', 'betas'))
+    exp_avg_sq, step = pick(state, ('exp_avg_sq', 'step'))
 
-    exp_avg_sq = state['exp_avg_sq']
-
-    step = state['step']
     step = step.item() if is_tensor(step) else step
 
     v_hat = exp_avg_sq / (1 - beta2 ** step) if step > 0 else exp_avg_sq
@@ -439,6 +504,11 @@ PRECONDITIONING_FNS = {
 def register_preconditioning(optimizer_type, preconditioning_fn):
     PRECONDITIONING_FNS[optimizer_type] = preconditioning_fn
 
+# default learner lookback - the checkpoint from half the epochs ago
+
+def default_lookback_epoch_fn(epoch):
+    return epoch // 2
+
 # classes
 
 class SelfPlay(Module):
@@ -451,6 +521,12 @@ class SelfPlay(Module):
         learner_optimizer = None,
         learner_preconditioning_fn = None,
         learner_lr = 3e-4,
+        learner_weight_decay = 0.01,
+        learner_max_grad_norm = 1.,
+        generator_optimizer = None,
+        generator_lr = 3e-4,
+        generator_weight_decay = 0.01,
+        generator_max_grad_norm = 1.,
         learner_checkpoint_folder = 'learner_checkpoints',
         learner_lookback_epoch_fn = None,
         learner_checkpoint_strict = True
@@ -473,9 +549,19 @@ class SelfPlay(Module):
         # default learner optimizer
 
         if not exists(learner_optimizer):
-            learner_optimizer = AdamW(learner.parameters(), lr = learner_lr)
+            learner_optimizer = AdamW(learner.parameters(), lr = learner_lr, weight_decay = learner_weight_decay)
 
         self.learner_optimizer = learner_optimizer
+
+        # generator optimizer
+
+        if not exists(generator_optimizer):
+            generator_optimizer = AdamW(generator.parameters(), lr = generator_lr, weight_decay = generator_weight_decay)
+
+        self.generator_optimizer = generator_optimizer
+
+        self.learner_max_grad_norm = learner_max_grad_norm
+        self.generator_max_grad_norm = generator_max_grad_norm
 
         # default learner preconditioning derived from the optimizer
 
@@ -494,6 +580,10 @@ class SelfPlay(Module):
 
         self.learner_lookback_epoch_fn = default(learner_lookback_epoch_fn, default_lookback_epoch_fn)
         self.learner_checkpoint_strict = learner_checkpoint_strict
+
+        # generator prior for the kl, uniform by default
+
+        self.generator_prior = None
 
         self.save_checkpoint()
 
@@ -521,7 +611,7 @@ class SelfPlay(Module):
         return torch.load(path, map_location = 'cpu', weights_only = True)
 
     def parameter_difference(self, epoch, strict = None):
-        # δθ = θ_past − θ_now
+        # learner parameter difference over the lookback window, past minus current
 
         past_params = self.load_checkpoint(epoch, strict = strict)
 
@@ -544,6 +634,8 @@ class SelfPlay(Module):
             for param in param_group['params']
         }
 
+        optimizer_state = self.learner_optimizer.state
+
         preconditioning = dict()
 
         for name, param in self.learner.named_parameters():
@@ -551,18 +643,96 @@ class SelfPlay(Module):
                 continue
 
             param_group = param_groups.get(id(param), dict())
-            state = self.learner_optimizer.state.get(param, dict())
+            state = optimizer_state.get(param, dict())
             preconditioning[name] = preconditioning_fn(param, state, param_group)
 
         return preconditioning
 
     def preconditioned_parameter_difference(self, epoch, strict = None):
-        # preconditioned lookback tangent P ⊙ δθ, i.e. the generator reward
+        # preconditioned lookback tangent, i.e. the generator reward
 
         difference = self.parameter_difference(epoch, strict = strict)
         preconditioning = self.learner_preconditioning
 
         return {name: preconditioning[name] * diff for name, diff in difference.items()}
+
+    @torch.no_grad()
+    def advance_generator_prior(self):
+        # snapshot the current generator as the new prior
+
+        self.generator_prior = deepcopy(self.generator)
+        self.generator_prior.eval()
+
+    @torch.no_grad()
+    def prior_log_probs(
+        self,
+        replay_ids,
+        seq_mask,
+        prior_generator = None
+    ):
+        # prior generator - advanced past the fixed uniform prior
+
+        if exists(prior_generator):
+            logits = prior_generator(replay_ids, return_loss = False)
+            log_probs = batched_index_select(logits.log_softmax(dim = -1), replay_ids, dim = -1)
+
+            return masked_sum(log_probs, seq_mask, dim = -1)
+
+        # uniform prior over programs - shorter programs are more likely
+
+        lens = seq_mask.sum(dim = -1) + (replay_ids == self.generator.pad_id).any(dim = -1)
+
+        return -lens * math.log(self.generator.num_tokens)
+
+    def grpo_loss(
+        self,
+        rewards,         # (b)
+        *,
+        old_log_probs,   # (b n)
+        replay_ids,      # (b n)
+        prompt_len = 1,  # 1 for start token
+        log_ratio_clamp = (-20., 20.),
+        length_normalize = False,
+        seq_mask = None,
+        kl_loss_weight = 1.,
+        prior_generator = None,
+    ):
+        if not exists(seq_mask):
+            seq_mask = replay_ids != self.generator.pad_id
+            seq_mask[:, :prompt_len] = False
+
+        # replay log probs
+
+        replay_logits = self.generator(replay_ids, return_loss = False)
+        replay_log_probs = replay_logits.log_softmax(dim = -1)
+
+        token_log_probs = batched_index_select(replay_log_probs, replay_ids, dim = -1)
+
+        log_probs = masked_sum(token_log_probs, seq_mask, dim = -1)
+        old_log_probs = masked_sum(old_log_probs, seq_mask, dim = -1)
+
+        # advantage - normalized rewards minus the kl to the generator prior
+
+        prior_log_probs = self.prior_log_probs(replay_ids, seq_mask, prior_generator = prior_generator)
+
+        normed_rewards = z_score(rewards)
+        kl_to_prior = (log_probs - prior_log_probs).detach()
+
+        advantages = normed_rewards - kl_loss_weight * kl_to_prior
+
+        # sequence importance ratio
+
+        ratio_mult = 1.
+        if length_normalize:
+            ratio_mult = seq_mask.sum(dim = -1).clamp_min(1.) ** -1.
+
+        ratio = (log_probs - old_log_probs).mul(ratio_mult).clamp(*log_ratio_clamp).exp()
+
+        # grpo loss
+
+        grpo_loss = -(ratio * advantages).mean()
+
+        return grpo_loss, (normed_rewards, kl_to_prior)
 
     def forward(
         self,
@@ -571,11 +741,11 @@ class SelfPlay(Module):
         temperature = 1.,
         filter_thres = 0.9,
         verbose = True,
-        num_epochs = 1,
+        epochs = 1,
         decode_fn = None
     ):
         assert batch_size > 1, 'batch size must be greater than 1 for grpo'
-        assert num_epochs >= 1
+        assert epochs >= 1
 
         # default decode fn is the executor's
 
@@ -586,16 +756,20 @@ class SelfPlay(Module):
         losses = []
         loss_tangents = []
 
-        for _ in range(num_epochs):
+        for _ in range(epochs):
             # generate a batch of decoded programs, listening for eos
 
-            programs = self.generator.generate(
+            eos_ids = tuple(eid for eid in (self.executor.sos_eos_id, self.executor.halt_id) if exists(eid))
+
+            programs, program_generate_intermediates = self.generator.generate(
                 batch_size = batch_size,
                 max_length = max_length,
                 temperature = temperature,
                 filter_thres = filter_thres,
-                eos_id = self.executor.sos_eos_id,
-                decode_fn = decode_fn
+                sos_id = self.executor.sos_eos_id,
+                eos_ids = eos_ids,
+                decode_fn = decode_fn,
+                return_for_policy_optimization = True
             )
 
             # execute the programs
@@ -615,6 +789,9 @@ class SelfPlay(Module):
             loss = self.learner(ids, return_loss = True, reduce_loss = True)
             loss.backward()
 
+            if exists(self.learner_max_grad_norm):
+                clip_grad_norm_(self.learner.parameters(), self.learner_max_grad_norm)
+
             self.learner_optimizer.step()
             self.learner_optimizer.zero_grad()
 
@@ -625,13 +802,38 @@ class SelfPlay(Module):
 
             # preconditioned lookback tangent, used as the generator reward
 
-            tangent = self.preconditioned_parameter_difference(self.learner_lookback_epoch_fn(self.epoch.item()))
+            lookback_checkpoint = self.learner_lookback_epoch_fn(self.epoch.item())
+
+            tangent = self.preconditioned_parameter_difference(lookback_checkpoint)
 
             _, loss_tangent = self.learner.forward_with_jvp(ids, tangent)
 
-            # handle rl and reward weighted sft
+            # generator reward - alignment with the learner's preconditioned parameter movement
 
-            # todo - grpo / sft
+            rewards = loss_tangent.abs()
+
+            program_ids = program_generate_intermediates.decoded_ids
+            old_log_probs = program_generate_intermediates.old_log_probs
+            prompt_len = program_generate_intermediates.prompt_len
+
+            rl_loss, rl_loss_breakdown = self.grpo_loss(
+                rewards,
+                replay_ids = program_ids,
+                old_log_probs = old_log_probs,
+                prompt_len = prompt_len,
+                seq_mask = program_generate_intermediates.seq_mask,
+                prior_generator = self.generator_prior
+            )
+
+            rl_loss.backward()
+
+            if exists(self.generator_max_grad_norm):
+                clip_grad_norm_(self.generator.parameters(), self.generator_max_grad_norm)
+
+            self.generator_optimizer.step()
+            self.generator_optimizer.zero_grad()
+
+            # reward weighted sft - todo
 
             # accumulate
 

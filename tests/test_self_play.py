@@ -69,12 +69,24 @@ def test_self_play_handles_empty_outputs(tmp_path):
 
     self_play = SelfPlay(generator = generator, learner = learner, executor = executor, learner_checkpoint_folder = tmp_path)
 
-    losses, tangents = self_play(batch_size = 2, max_length = 4, verbose = False, num_epochs = 2, decode_fn = executor.decode)
+    losses, tangents = self_play(batch_size = 2, max_length = 4, verbose = False, epochs = 2, decode_fn = executor.decode)
 
     assert torch.isfinite(losses).all()
     assert torch.isfinite(tangents).all()
     assert (losses > 0).all()
     assert (tangents != 0).any()
+
+def test_generate_seq_mask_matches_derived_mask():
+    torch.manual_seed(0)
+
+    model = Transformer(num_tokens = 16, dim = 16, depth = 1, dim_head = 8, heads = 2)
+
+    _, info = model.generate(batch_size = 4, max_length = 8, filter_thres = 0., return_for_policy_optimization = True)
+
+    derived = info.decoded_ids != model.pad_id
+    derived[:, :info.prompt_len] = False
+
+    assert (derived == info.seq_mask).all()
 
 @param('executor_type', (Brainfuck, Forth))
 @param('optimizer_type', (None, AdamW, SGD))
@@ -107,7 +119,7 @@ def test_self_play(optimizer_type, executor_type, tmp_path):
 
     num_epochs = 2
 
-    losses, tangents = self_play(batch_size = 2, max_length = 8, verbose = False, num_epochs = num_epochs, decode_fn = executor.decode)
+    losses, tangents = self_play(batch_size = 2, max_length = 8, verbose = False, epochs = num_epochs, decode_fn = executor.decode)
 
     assert losses.shape == (num_epochs,)
     assert tangents.shape == (num_epochs, 2)

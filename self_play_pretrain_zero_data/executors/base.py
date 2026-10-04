@@ -40,6 +40,14 @@ class Executor(ABC):
     sos_eos_id = 0
     pad_id = -1
 
+    @property
+    def halt_id(self):
+        """single-token program terminator, e.g. `F` for brainfuck, if defined"""
+
+        halt_symbol = getattr(self, 'halt_symbol', None)
+
+        return self.token_to_id[halt_symbol] if exists(halt_symbol) and halt_symbol in self.token_to_id else None
+
     @abstractmethod
     def encode(
         self,
