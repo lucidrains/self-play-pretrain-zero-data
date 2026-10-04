@@ -12,9 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn, arange, cat, isin, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm
-from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam, AdamW
 from torch.func import functional_call, jvp
+
+from accelerate import Accelerator
 
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
@@ -517,6 +518,8 @@ class SelfPlay(Module):
         generator: Module,
         learner: Module,
         executor: Executor,
+        accelerator = None,
+        cpu = False,
         learned_tokenizer_encode = None,
         learner_optimizer = None,
         learner_preconditioning_fn = None,
@@ -532,6 +535,10 @@ class SelfPlay(Module):
         learner_checkpoint_strict = True
     ):
         super().__init__()
+
+        # accelerator, handles device placement (mps on apple silicon) and distributed training
+
+        self.accelerator = default(accelerator, Accelerator(cpu = cpu))
 
         # generator and executor must share the same vocabulary size
 
@@ -585,7 +592,33 @@ class SelfPlay(Module):
 
         self.generator_prior = None
 
+        # hand models and optimizers over to accelerate for placement and wrapping
+
+        (
+            self.generator,
+            self.learner,
+            self.generator_optimizer,
+            self.learner_optimizer
+        ) = self.accelerator.prepare(
+            generator,
+            learner,
+            generator_optimizer,
+            learner_optimizer
+        )
+
         self.save_checkpoint()
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    @property
+    def unwrapped_generator(self):
+        return self.accelerator.unwrap_model(self.generator)
+
+    @property
+    def unwrapped_learner(self):
+        return self.accelerator.unwrap_model(self.learner)
 
     def checkpoint_path(self, epoch):
         return self.learner_checkpoint_folder / f'learner.{int(epoch)}.pt'
@@ -597,7 +630,7 @@ class SelfPlay(Module):
 
     def save_checkpoint(self, epoch = None):
         epoch = default(epoch, self.epoch.item())
-        torch.save(self.learner.state_dict(), self.checkpoint_path(epoch))
+        torch.save(self.unwrapped_learner.state_dict(), self.checkpoint_path(epoch))
 
     def load_checkpoint(self, epoch, strict = None):
         # strict fails on a missing checkpoint, else the nearest one is used
@@ -615,11 +648,12 @@ class SelfPlay(Module):
 
         past_params = self.load_checkpoint(epoch, strict = strict)
 
-        trainable_names = self.learner.trainable_parameter_names()
+        learner = self.unwrapped_learner
+        trainable_names = learner.trainable_parameter_names()
 
         return {
             name: (past_params[name].to(param) - param).detach()
-            for name, param in self.learner.named_parameters()
+            for name, param in learner.named_parameters()
             if name in trainable_names
         }
 
@@ -638,7 +672,7 @@ class SelfPlay(Module):
 
         preconditioning = dict()
 
-        for name, param in self.learner.named_parameters():
+        for name, param in self.unwrapped_learner.named_parameters():
             if not param.requires_grad:
                 continue
 
@@ -660,7 +694,7 @@ class SelfPlay(Module):
     def advance_generator_prior(self):
         # snapshot the current generator as the new prior
 
-        self.generator_prior = deepcopy(self.generator)
+        self.generator_prior = deepcopy(self.unwrapped_generator)
         self.generator_prior.eval()
 
     @torch.no_grad()
@@ -680,9 +714,11 @@ class SelfPlay(Module):
 
         # uniform prior over programs - shorter programs are more likely
 
-        lens = seq_mask.sum(dim = -1) + (replay_ids == self.generator.pad_id).any(dim = -1)
+        generator = self.unwrapped_generator
 
-        return -lens * math.log(self.generator.num_tokens)
+        lens = seq_mask.sum(dim = -1) + (replay_ids == generator.pad_id).any(dim = -1)
+
+        return -lens * math.log(generator.num_tokens)
 
     def grpo_loss(
         self,
@@ -697,13 +733,15 @@ class SelfPlay(Module):
         kl_loss_weight = 1.,
         prior_generator = None,
     ):
+        generator = self.unwrapped_generator
+
         if not exists(seq_mask):
-            seq_mask = replay_ids != self.generator.pad_id
+            seq_mask = replay_ids != generator.pad_id
             seq_mask[:, :prompt_len] = False
 
         # replay log probs
 
-        replay_logits = self.generator(replay_ids, return_loss = False)
+        replay_logits = generator(replay_ids, return_loss = False)
         replay_log_probs = replay_logits.log_softmax(dim = -1)
 
         token_log_probs = batched_index_select(replay_log_probs, replay_ids, dim = -1)
@@ -761,7 +799,9 @@ class SelfPlay(Module):
 
             eos_ids = tuple(eid for eid in (self.executor.sos_eos_id, self.executor.halt_id) if exists(eid))
 
-            programs, program_generate_intermediates = self.generator.generate(
+            generator, learner = self.unwrapped_generator, self.unwrapped_learner
+
+            programs, program_generate_intermediates = generator.generate(
                 batch_size = batch_size,
                 max_length = max_length,
                 temperature = temperature,
@@ -782,15 +822,15 @@ class SelfPlay(Module):
 
             # encode executor outputs for the learner
 
-            ids = self.learned_tokenizer_encode(outputs)
+            ids = self.learned_tokenizer_encode(outputs).to(self.device)
 
             # learner step on next token prediction
 
-            loss = self.learner(ids, return_loss = True, reduce_loss = True)
-            loss.backward()
+            loss = learner(ids, return_loss = True, reduce_loss = True)
+            self.accelerator.backward(loss)
 
             if exists(self.learner_max_grad_norm):
-                clip_grad_norm_(self.learner.parameters(), self.learner_max_grad_norm)
+                self.accelerator.clip_grad_norm_(learner.parameters(), self.learner_max_grad_norm)
 
             self.learner_optimizer.step()
             self.learner_optimizer.zero_grad()
@@ -806,7 +846,7 @@ class SelfPlay(Module):
 
             tangent = self.preconditioned_parameter_difference(lookback_checkpoint)
 
-            _, loss_tangent = self.learner.forward_with_jvp(ids, tangent)
+            _, loss_tangent = learner.forward_with_jvp(ids, tangent)
 
             # generator reward - alignment with the learner's preconditioned parameter movement
 
@@ -825,10 +865,10 @@ class SelfPlay(Module):
                 prior_generator = self.generator_prior
             )
 
-            rl_loss.backward()
+            self.accelerator.backward(rl_loss)
 
             if exists(self.generator_max_grad_norm):
-                clip_grad_norm_(self.generator.parameters(), self.generator_max_grad_norm)
+                self.accelerator.clip_grad_norm_(generator.parameters(), self.generator_max_grad_norm)
 
             self.generator_optimizer.step()
             self.generator_optimizer.zero_grad()
