@@ -22,7 +22,7 @@ from ema_pytorch import EMA
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import batched_index_select, clamp, lens_to_mask, masked_mean, masked_sum, pack_with_inverse, pad_left_at_dim, pad_sequence, temp_eval, tree_map_detach, z_score
+from torch_einops_utils import batched_index_select, clamp, lens_to_mask, masked_mean, masked_sum, maybe_return, pack_with_inverse, pad_left_at_dim, pad_sequence, temp_eval, tree_map_detach, z_score
 from torch_einops_utils.device import move_inputs_to_module_device
 from torch_einops_utils.shape import shape, size
 from torch_einops_utils.torch_einops_utils import identity
@@ -58,6 +58,12 @@ def rewards_to_loss_weights(
     total_positive_reward = positive_rewards.sum().clamp_min(eps)
 
     return positive_rewards / total_positive_reward
+
+def representation_alignment_loss(
+    learner_repr,   # (b d)
+    generator_repr  # (b d)
+):
+    return (1. - F.cosine_similarity(learner_repr, generator_repr, dim = -1)).mean()
 
 # sampling helpers
 
@@ -193,6 +199,12 @@ class FeedForward(Module):
         return self.proj_out(x)
 
 # transformer
+
+def transformer_primary_fields(fn_kwargs):
+    if not fn_kwargs.get('return_loss', False):
+        return ('logits', 'memory') if fn_kwargs.get('return_memory', False) else 'logits'
+
+    return ('loss', 'loss_mask') if not fn_kwargs.get('reduce_loss', False) else 'loss'
 
 class Transformer(Module):
     def __init__(
@@ -419,6 +431,7 @@ class Transformer(Module):
 
         return seq_loss, seq_loss_tangent
 
+    @maybe_return('pooled_repr', primary = transformer_primary_fields)
     def forward(
         self,
         ids,
@@ -426,12 +439,14 @@ class Transformer(Module):
         return_loss = False,
         return_memory = False,
         reduce_loss = False,
-        loss_weights = None
+        loss_weights = None,
+        return_pooled_repr = False
     ):
         has_memory = exists(memory)
 
         assert not (has_memory and return_loss), 'return loss cannot be turned on when a memory is passed in'
         assert not (exists(loss_weights) and not reduce_loss), 'loss weights are applied after the sequence reduction'
+        assert not (return_pooled_repr and has_memory), 'representations are not returned when a memory is passed in'
 
         # memory is (tokens seen, [(k, v), ...]) - tokens seen is shared across layers
 
@@ -444,6 +459,8 @@ class Transformer(Module):
 
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]
+
+        repr_mask = ids != pad_id
 
         ids = ids.masked_fill(ids == pad_id, 0)
 
@@ -474,13 +491,17 @@ class Transformer(Module):
 
         logits = self.to_logits(tokens)
 
+        # pooled representation over content tokens
+
+        pooled_repr = masked_mean(tokens, repr_mask, dim = -2) if return_pooled_repr else None
+
         # maybe early return logits and memories
 
         if not return_loss:
             if not return_memory:
-                return logits
+                return logits, pooled_repr
 
-            return logits, (tokens_seen + seq_len, next_memories)
+            return logits, (tokens_seen + seq_len, next_memories), pooled_repr
 
         loss = F.cross_entropy(
             rearrange(logits, 'b n v -> b v n'),
@@ -494,7 +515,7 @@ class Transformer(Module):
         # unreduced token loss and mask, for the jvp tangent
 
         if not reduce_loss:
-            return loss, loss_mask
+            return loss, loss_mask, pooled_repr
 
         # sequence mean over content tokens
 
@@ -503,9 +524,11 @@ class Transformer(Module):
         # per sequence weights, expected to already be normalized by the caller
 
         if exists(loss_weights):
-            return (seq_loss * loss_weights).sum()
+            seq_loss = (seq_loss * loss_weights).sum()
+        else:
+            seq_loss = seq_loss.mean()
 
-        return seq_loss.mean()
+        return seq_loss, pooled_repr
 
 # default learner tokenizer
 
@@ -663,6 +686,7 @@ class SelfPlay(Module):
         generator_weight_decay = 0.01,
         generator_max_grad_norm = 1.,
         expert_iter_loss_weight = 1.0,
+        representation_alignment_loss_weight = 0.0,
         learner_reference = None
     ):
         super().__init__()
@@ -704,6 +728,10 @@ class SelfPlay(Module):
         # weight of the reward weighted sft term - eq. 5 of the paper
 
         self.expert_iter_loss_weight = expert_iter_loss_weight
+
+        # cosine alignment of the learner representations to the generator program representations
+
+        self.representation_alignment_loss_weight = representation_alignment_loss_weight
 
         # default learner preconditioning derived from the optimizer
 
@@ -944,7 +972,23 @@ class SelfPlay(Module):
 
             # learner step on next token prediction
 
-            loss = learner(ids, return_loss = True, reduce_loss = True)
+            alignment_loss_weight = self.representation_alignment_loss_weight
+
+            if alignment_loss_weight > 0.:
+                program_ids = program_generate_intermediates.decoded_ids
+
+                with torch.no_grad():
+                    _, generator_repr = generator(program_ids, return_pooled_repr = True)
+
+                loss, learner_repr = learner(ids, return_loss = True, reduce_loss = True, return_pooled_repr = True)
+
+                assert learner_repr.shape == generator_repr.shape, 'learner and generator representations must share a hidden dimension for alignment'
+
+                alignment_loss = representation_alignment_loss(learner_repr, generator_repr.detach())
+                loss = loss + alignment_loss_weight * alignment_loss
+            else:
+                loss = learner(ids, return_loss = True, reduce_loss = True)
+
             self.accelerator.backward(loss)
 
             if exists(self.learner_max_grad_norm):

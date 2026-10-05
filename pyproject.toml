@@ -1,6 +1,6 @@
 [project]
 name = "self-play-pretrain-zero-data"
-version = "0.0.20"
+version = "0.0.21"
 description = "Implementation of Self-Play Pretraining with Zero Data"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -32,7 +32,7 @@ dependencies = [
     "jvp_flash_attention",
     "rotary-embedding-torch",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.35",
+    "torch-einops-utils>=0.1.36",
     "x-transformers"
 ]
 
@@ -43,6 +43,11 @@ Repository = "https://codeberg.org/lucidrains/self-play-pretrain-zero-data"
 [project.optional-dependencies]
 examples = []
 test = [
+    "pytest"
+]
+
+[dependency-groups]
+dev = [
     "pytest"
 ]
 

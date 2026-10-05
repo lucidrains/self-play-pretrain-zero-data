@@ -5,7 +5,7 @@ from torch.optim import AdamW, SGD
 from torch_einops_utils import masked_mean
 
 from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, SelfPlay
-from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning, rewards_to_loss_weights
+from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning, representation_alignment_loss, rewards_to_loss_weights
 
 param = pytest.mark.parametrize
 
@@ -128,6 +128,61 @@ def test_self_play_handles_empty_outputs(tmp_path):
     assert torch.isfinite(tangents).all()
     assert (losses > 0).all()
     assert (tangents != 0).any()
+
+def test_representation_alignment(tmp_path):
+    torch.manual_seed(0)
+
+    model = Transformer(num_tokens = 256, dim = 8, depth = 1, dim_head = 8, heads = 1)
+
+    ids = torch.randint(1, 256, (4, 12))
+
+    logits, pooled_repr = model(ids, return_pooled_repr = True)
+
+    assert logits.shape == (4, 12, 256)
+    assert pooled_repr.shape == (4, 8)
+
+    loss, pooled_repr = model(ids, return_loss = True, reduce_loss = True, return_pooled_repr = True)
+
+    assert loss.shape == ()
+    assert pooled_repr.shape == (4, 8)
+
+    # cosine alignment against a detached generator target, zero for identical representations
+
+    generator_repr = torch.randn(4, 8)
+
+    alignment_loss = representation_alignment_loss(pooled_repr, generator_repr.detach())
+
+    expected = (1. - torch.nn.functional.cosine_similarity(pooled_repr, generator_repr, dim = -1)).mean()
+
+    assert torch.allclose(alignment_loss, expected)
+
+    alignment_loss.backward()
+
+    assert model.token_emb.weight.grad is not None
+
+    same = torch.randn(3, 8)
+
+    assert representation_alignment_loss(same, same.detach()).item() < 1e-6
+
+    # end to end with the alignment term active
+
+    executor = EmptyExecutor()
+
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 8, depth = 1, dim_head = 8, heads = 1)
+    learner = Transformer(num_tokens = 256 + 1, dim = 8, depth = 1, dim_head = 8, heads = 1)
+
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        learner_reference = CheckpointReference(folder = tmp_path),
+        representation_alignment_loss_weight = 1.
+    )
+
+    losses, tangents = self_play(batch_size = 2, max_length = 4, verbose = False, epochs = 1, decode_fn = executor.decode)
+
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(tangents).all()
 
 def test_generate_seq_mask_matches_derived_mask():
     torch.manual_seed(0)
