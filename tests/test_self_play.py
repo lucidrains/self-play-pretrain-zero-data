@@ -2,8 +2,10 @@ import pytest
 import torch
 from torch.optim import AdamW, SGD
 
+from torch_einops_utils import masked_mean
+
 from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, SelfPlay
-from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning
+from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning, rewards_to_loss_weights
 
 param = pytest.mark.parametrize
 
@@ -24,6 +26,27 @@ def test_transformer():
     loss, loss_mask = model(ids, return_loss = True)
 
     assert loss.shape == loss_mask.shape == (1, 1023)
+
+def test_transformer_weighted_loss():
+    torch.manual_seed(0)
+
+    model = Transformer(num_tokens = 256, dim = 16, depth = 1, dim_head = 8, heads = 2)
+
+    ids = torch.randint(0, 256, (3, 17))
+    rewards = torch.tensor([1., -1., 3.])
+
+    weights = rewards_to_loss_weights(rewards)
+
+    assert torch.allclose(weights, torch.tensor([0.25, 0., 0.75]))
+
+    loss, loss_mask = model(ids, return_loss = True)
+    seq_loss = masked_mean(loss, loss_mask, dim = -1)
+
+    assert torch.allclose(model(ids, return_loss = True, reduce_loss = True), seq_loss.mean())
+
+    weighted_loss = model(ids, return_loss = True, reduce_loss = True, loss_weights = weights)
+
+    assert torch.allclose(weighted_loss, (seq_loss * weights).sum())
 
 def test_empty_output_gets_eos_target():
     model = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)

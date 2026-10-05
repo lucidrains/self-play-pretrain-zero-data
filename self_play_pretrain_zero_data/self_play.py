@@ -46,6 +46,19 @@ def default(v, d):
 def pick(d, keys):
     return tuple(d[key] for key in keys)
 
+# rewards to expert iteration weights - section 2.2 of the paper, w_i in the generator objective (eq. 5)
+
+def rewards_to_loss_weights(
+    rewards, # (b,)
+    eps = 1e-5
+):
+    # w_i = [r_i]_+ / sum_j [r_j]_+
+
+    positive_rewards = F.relu(rewards)
+    total_positive_reward = positive_rewards.sum().clamp_min(eps)
+
+    return positive_rewards / total_positive_reward
+
 # sampling helpers
 
 def log(t, eps = 1e-20):
@@ -400,11 +413,13 @@ class Transformer(Module):
         memory = None,
         return_loss = False,
         return_memory = False,
-        reduce_loss = False
+        reduce_loss = False,
+        loss_weights = None
     ):
         has_memory = exists(memory)
 
         assert not (has_memory and return_loss), 'return loss cannot be turned on when a memory is passed in'
+        assert not (exists(loss_weights) and not reduce_loss), 'loss weights are applied after the sequence reduction'
 
         # memory is (tokens seen, [(k, v), ...]) - tokens seen is shared across layers
 
@@ -459,15 +474,26 @@ class Transformer(Module):
             rearrange(logits, 'b n v -> b v n'),
             labels,
             ignore_index = pad_id,
-            reduction = 'mean' if reduce_loss else 'none'
+            reduction = 'none'
         )
-
-        if reduce_loss:
-            return loss
 
         loss_mask = labels != pad_id
 
-        return loss, loss_mask
+        # unreduced token loss and mask, for the jvp tangent
+
+        if not reduce_loss:
+            return loss, loss_mask
+
+        # sequence mean over content tokens
+
+        seq_loss = masked_mean(loss, loss_mask, dim = -1)
+
+        # per sequence weights, expected to already be normalized by the caller
+
+        if exists(loss_weights):
+            return (seq_loss * loss_weights).sum()
+
+        return seq_loss.mean()
 
 # default learner tokenizer
 
