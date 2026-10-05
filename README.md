@@ -61,3 +61,15 @@ torch.save(learner.state_dict(), './learner.pt')
     url     = {https://arxiv.org/abs/2506.20057},
 }
 ```
+
+```bibtex
+@misc{lee2026traininglanguagemodelsneural,
+    title    = {Training Language Models via Neural Cellular Automata},
+    author   = {Dan Lee and Seungwook Han and Akarsh Kumar and Pulkit Agrawal},
+    year     = {2026},
+    eprint   = {2603.10055},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url      = {https://arxiv.org/abs/2603.10055},
+}
+```

@@ -1,4 +1,4 @@
-from self_play_pretrain_zero_data import Brainfuck, Forth
+from self_play_pretrain_zero_data import Brainfuck, Forth, NeuralCellularAutomata
 from self_play_pretrain_zero_data.archive import (
     QualityDiversityArchive,
     execution_loops_descriptor,
@@ -36,7 +36,12 @@ def test_program_outputs_are_archived():
         ('3 BEGIN DUP EMIT 1 - DUP 0= UNTIL', '\x03\x02\x01'),
     )
 
-    for executor, cases in ((Brainfuck(), brainfuck_cases), (Forth(), forth_cases)):
+    nca_cases = (
+        ('+1;11/11;21/12;22/22', '32/23'),
+        ('-1;11/11;21/12;22/22', '21/12'),
+    )
+
+    for executor, cases in ((Brainfuck(), brainfuck_cases), (Forth(), forth_cases), (NeuralCellularAutomata(), nca_cases)):
         archive = QualityDiversityArchive(executor = executor)
 
         for program, expected_output in cases:
@@ -129,7 +134,13 @@ def test_age_expiration_decays_and_evicts():
     assert len(archive) == 0
 
 def test_mutation_produces_executable_programs():
-    for executor, program in ((Brainfuck(), '+++[->+<].'), (Forth(), '1 2 + EMIT')):
+    cases = (
+        (Brainfuck(), '+++[->+<].'),
+        (Forth(), '1 2 + EMIT'),
+        (NeuralCellularAutomata(), '+1;11/11;21/12;22/22')
+    )
+
+    for executor, program in cases:
         archive = QualityDiversityArchive(executor = executor)
 
         mutants = [archive.mutate(program) for _ in range(32)]

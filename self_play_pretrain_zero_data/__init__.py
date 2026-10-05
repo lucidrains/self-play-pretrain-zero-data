@@ -19,5 +19,6 @@ from self_play_pretrain_zero_data.executors import (
     Executor,
     ExecutionInfo,
     Brainfuck,
-    Forth
+    Forth,
+    NeuralCellularAutomata
 )

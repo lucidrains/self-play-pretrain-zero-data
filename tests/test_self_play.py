@@ -4,7 +4,7 @@ from torch.optim import AdamW, SGD
 
 from torch_einops_utils import masked_mean
 
-from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, SelfPlay
+from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, SelfPlay
 from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning, rewards_to_loss_weights
 
 param = pytest.mark.parametrize
@@ -26,6 +26,24 @@ def test_transformer():
     loss, loss_mask = model(ids, return_loss = True)
 
     assert loss.shape == loss_mask.shape == (1, 1023)
+
+def test_parallel_forward_matches_stepwise_memory():
+    torch.manual_seed(0)
+
+    model = Transformer(num_tokens = 256, dim = 64, depth = 3, dim_head = 16, heads = 4).eval()
+
+    ids = torch.randint(0, 256, (2, 8))
+
+    with torch.no_grad():
+        parallel = model(ids)
+
+        memory, stepwise = None, []
+
+        for token in ids.split(1, dim = 1):  # one token at a time, carrying memory
+            logits, memory = model(token, memory = memory, return_memory = True)
+            stepwise.append(logits)
+
+    assert torch.allclose(parallel, torch.cat(stepwise, dim = 1), atol = 1e-5)
 
 def test_transformer_weighted_loss():
     torch.manual_seed(0)
@@ -116,15 +134,22 @@ def test_generate_seq_mask_matches_derived_mask():
 
     model = Transformer(num_tokens = 16, dim = 16, depth = 1, dim_head = 8, heads = 2)
 
-    _, info = model.generate(batch_size = 4, max_length = 8, filter_thres = 0., return_for_policy_optimization = True)
+    generate_kwargs = (
+        dict(batch_size = 4),
+        dict(prompt_ids = [[3, 4], [5, 6]], prepend_sos = True)
+    )
 
-    derived = info.decoded_ids != model.pad_id
-    derived[:, :info.prompt_len] = False
+    for kwargs in generate_kwargs:
+        _, info = model.generate(max_length = 8, filter_thres = 0., return_for_policy_optimization = True, **kwargs)
 
-    assert (derived == info.seq_mask).all()
+        # fallback derived by grpo_loss when seq_mask is not given
+        derived = info.decoded_ids != model.pad_id
+        derived[:, :info.prompt_len] = False
+
+        assert (derived == info.seq_mask).all()
 
 @param('reference_fn', reference_fns.values(), ids = reference_fns.keys())
-@param('executor_type', (Brainfuck, Forth))
+@param('executor_type', (Brainfuck, Forth, NeuralCellularAutomata))
 @param('optimizer_type', (None, AdamW, SGD))
 def test_self_play(reference_fn, optimizer_type, executor_type, tmp_path):
     torch.manual_seed(0)
