@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn, arange, cat, isin, stack, tensor, is_tensor
-from torch.nn import Module, ModuleList, Linear, RMSNorm
+from torch.nn import Module, ModuleList, Linear
 from torch.optim import Adam, AdamW
 from torch.func import functional_call, jvp
 
@@ -82,6 +82,21 @@ def top_k(logits, thres = 0.9):
 def gumbel_sample(logits, temperature = 1.):
     logits = logits / temperature
     return (logits + gumbel_noise_like(logits)).argmax(dim = -1)
+
+# rmsnorm, as the fused torch kernel is not forward ad compatible on mps
+
+class RMSNorm(Module):
+    def __init__(
+        self,
+        dim,
+        eps = 1e-8
+    ):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(dim = -1, keepdim = True) + self.eps) * self.weight
 
 # attention
 
@@ -386,26 +401,23 @@ class Transformer(Module):
 
         tangent = {name: t for name, t in tangent.items() if name in trainable_names}
 
-        # forward with functional call, returning token mean loss and per sequence mean loss for the tangent (generator reward), accounting for padding
+        # per sequence loss for the tangent (generator reward), accounting for padding
 
         def functional_forward(p):
             loss, loss_mask = functional_call(self, p, (ids,), dict(return_loss = True, reduce_loss = False))
 
-            token_mean_loss = masked_mean(loss, loss_mask)
-            seq_mean_loss = masked_mean(loss, loss_mask, dim = -1)
-
-            return token_mean_loss, seq_mean_loss
+            return masked_mean(loss, loss_mask, dim = -1)
 
         # jvp
 
-        (token_loss, _), (_, seq_loss_tangent) = jvp(functional_forward, (params,), (tangent,))
+        seq_loss, seq_loss_tangent = jvp(functional_forward, (params,), (tangent,))
 
         # just detach by default, as it is used as rewards downstream
 
         if detach_seq_loss_tangent:
             seq_loss_tangent = seq_loss_tangent.detach()
 
-        return token_loss, seq_loss_tangent
+        return seq_loss, seq_loss_tangent
 
     def forward(
         self,
@@ -695,6 +707,7 @@ class SelfPlay(Module):
         generator_lr = 3e-4,
         generator_weight_decay = 0.01,
         generator_max_grad_norm = 1.,
+        expert_iter_loss_weight = 1.0,
         learner_reference = None
     ):
         super().__init__()
@@ -732,6 +745,10 @@ class SelfPlay(Module):
 
         self.learner_max_grad_norm = learner_max_grad_norm
         self.generator_max_grad_norm = generator_max_grad_norm
+
+        # weight of the reward weighted sft term - eq. 5 of the paper
+
+        self.expert_iter_loss_weight = expert_iter_loss_weight
 
         # default learner preconditioning derived from the optimizer
 
@@ -905,7 +922,18 @@ class SelfPlay(Module):
 
         grpo_loss = -(ratio * advantages).mean()
 
-        return grpo_loss, (normed_rewards, kl_to_prior)
+        return grpo_loss, (normed_rewards, kl_to_prior), log_probs
+
+    def expert_iter_loss(
+        self,
+        rewards,    # (b)
+        log_probs   # (b)
+    ):
+        # reward weighted sft on the programs - eq. 5
+
+        weights = rewards_to_loss_weights(rewards)
+
+        return -(weights * log_probs).sum()
 
     def forward(
         self,
@@ -989,7 +1017,7 @@ class SelfPlay(Module):
             old_log_probs = program_generate_intermediates.old_log_probs
             prompt_len = program_generate_intermediates.prompt_len
 
-            rl_loss, rl_loss_breakdown = self.grpo_loss(
+            rl_loss, rl_loss_breakdown, program_log_probs = self.grpo_loss(
                 rewards,
                 replay_ids = program_ids,
                 old_log_probs = old_log_probs,
@@ -998,15 +1026,18 @@ class SelfPlay(Module):
                 prior_generator = self.generator_prior
             )
 
-            self.accelerator.backward(rl_loss)
+            # expert iter - reward weighted sft on the same programs
+
+            ei_loss = self.expert_iter_loss(rewards, program_log_probs)
+            generator_loss = rl_loss + self.expert_iter_loss_weight * ei_loss
+
+            self.accelerator.backward(generator_loss)
 
             if exists(self.generator_max_grad_norm):
                 self.accelerator.clip_grad_norm_(generator.parameters(), self.generator_max_grad_norm)
 
             self.generator_optimizer.step()
             self.generator_optimizer.zero_grad()
-
-            # reward weighted sft - todo
 
             # accumulate
 

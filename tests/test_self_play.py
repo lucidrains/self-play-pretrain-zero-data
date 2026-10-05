@@ -74,7 +74,7 @@ def test_forward_with_jvp():
 
     loss, loss_tangent = model.forward_with_jvp(ids, tangent)
 
-    assert loss.shape == ()
+    assert loss.shape == (3,)
     assert loss_tangent.shape == (3,)
 
 class EmptyExecutor(Executor):
