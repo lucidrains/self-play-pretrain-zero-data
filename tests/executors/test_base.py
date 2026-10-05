@@ -38,6 +38,10 @@ def test_bct():
     assert BCT(max_steps = 11)('00111', input = '101') == '10110'
     assert BCT()('') == ''
 
+    info = BCT(max_steps = 11).execute('00111', input = '101')
+    assert info.output == '10110'
+    assert info.steps == 5
+
 def test_self_play_accepts_contrived_executor(tmp_path):
     executor = BCT()
 

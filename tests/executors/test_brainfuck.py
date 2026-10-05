@@ -13,6 +13,17 @@ def test_hello_world():
     assert Brainfuck()(HELLO_WORLD) == "Hello World!\n"
 
 
+def test_execute_returns_intermediates():
+    info = Brainfuck().execute('+++[-].')
+
+    assert info.program == '+++[-].'
+    assert info.output == '\x00'
+    assert info.steps == 11
+    assert info.loops == 2
+
+    assert Brainfuck()('+++[-].') == info.output
+
+
 def test_reads_input():
     assert Brainfuck()(',.', input='A') == 'A'
 

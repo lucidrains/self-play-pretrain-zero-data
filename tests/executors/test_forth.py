@@ -10,6 +10,19 @@ def test_literals_and_arithmetic():
     assert Forth()('5 NEGATE EMIT') == '\xfb'
 
 
+def test_execute_returns_intermediates():
+    program = '3 BEGIN DUP EMIT 1 - DUP 0= UNTIL BYE'
+
+    info = Forth().execute(program)
+
+    assert info.program == program
+    assert info.output == '\x03\x02\x01'
+    assert info.steps == 23
+    assert info.loops == 2
+
+    assert Forth()(program) == info.output
+
+
 def test_stack_words():
     assert Forth()('1 2 SWAP EMIT EMIT') == '\x01\x02'
     assert Forth()('65 DUP + EMIT') == '\x82'

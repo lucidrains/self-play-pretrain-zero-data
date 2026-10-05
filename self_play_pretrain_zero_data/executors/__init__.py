@@ -1,3 +1,3 @@
-from self_play_pretrain_zero_data.executors.base import Executor
+from self_play_pretrain_zero_data.executors.base import Executor, ExecutionInfo
 from self_play_pretrain_zero_data.executors.brainfuck import Brainfuck
 from self_play_pretrain_zero_data.executors.forth import Forth

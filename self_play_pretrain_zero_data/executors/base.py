@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from itertools import chain, repeat
 
 # helpers
@@ -29,6 +30,15 @@ def input_stream(
     return chain((b % mod for b in bytes_in), fallback)
 
 # classes
+
+@dataclass(frozen = True)
+class ExecutionInfo:
+    """output and dynamics of one program run - the input to behavior descriptors"""
+
+    program: str
+    output: str = ''
+    steps: int = 0  # instructions or words executed
+    loops: int = 0  # backward control flow jumps, i.e. loop iterations
 
 class Executor(ABC):
     """maps a program string to its output string
@@ -62,11 +72,23 @@ class Executor(ABC):
     ) -> str:
         raise NotImplementedError
 
-    @abstractmethod
     def __call__(
         self,
         program: str,
         input = '',
         seed = None
     ) -> str:
-        raise NotImplementedError
+        return self.execute(program, input, seed).output
+
+    def execute(
+        self,
+        program: str,
+        input = '',
+        seed = None
+    ) -> ExecutionInfo:
+        """output plus execution intermediates, falls back to wrapping an overridden `__call__`"""
+
+        if type(self).__call__ is Executor.__call__:
+            raise NotImplementedError
+
+        return ExecutionInfo(program, self.__call__(program, input, seed), steps = len(program))

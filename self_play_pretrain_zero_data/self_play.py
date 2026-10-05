@@ -642,51 +642,6 @@ class EMAReference(LearnerReference):
 
 # classes
 
-# quality diversity archive - elite programs per structural niche
-
-def program_length_descriptor(program, output = None, execution_info = None):
-    return len(program)
-
-class QualityDiversityArchive(Module):
-    def __init__(
-        self,
-        descriptor_fns = None,
-        *,
-        max_programs_per_niche = 8,
-        reward_decay = 0.97
-    ):
-        super().__init__()
-
-        # each descriptor fn -> one niche coordinate
-
-        self.descriptor_fns = default(descriptor_fns, (program_length_descriptor,))
-
-        self.max_programs_per_niche = max_programs_per_niche
-        self.reward_decay = reward_decay
-
-        # niche -> entries of (reward, program, output)
-
-        self.archive = dict()
-
-    def derive_descriptors(self, program, output = None, execution_info = None):
-        # program -> niche key
-        raise NotImplementedError
-
-    def add(self, program, output, reward, execution_info = None):
-        # keep top per niche
-        raise NotImplementedError
-
-    def remove(self, program):
-        raise NotImplementedError
-
-    def advance_age(self):
-        # decay rewards so stale elites get displaced
-        raise NotImplementedError
-
-    def mutate(self, program):
-        # single-token substitution, insertion, or deletion
-        raise NotImplementedError
-
 # self play
 
 class SelfPlay(Module):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import string
 
-from self_play_pretrain_zero_data.executors.base import Executor, input_stream
+from self_play_pretrain_zero_data.executors.base import Executor, ExecutionInfo, input_stream
 
 # constants
 
@@ -44,31 +44,21 @@ def control_jumps(tokens):
 class Forth(Executor):
     """minimal forth execution semantics - every string is executable
 
-    - `stack_size`: number of cells, extra pushes are dropped
-    - `cell_modulus`: every cell is kept modulo this
-    - `max_steps`: token budget (each word or literal costs 1 step), then halt
-    - `max_output_len`: output byte budget, then halt
-    - `halt_word`: tokens from here on are ignored, `BYE` by default
-    - `unknown_words_are_noops`: unknown tokens are ignored, else halt
-    - `stack_underflow_is_zero`: empty stack pops yield zero, else halt
-    - `random_input`: `KEY` falls back to uniform random cells, else zeros
-    - `case_sensitive`: tokens are folded to uppercase by default
-
     words - literals, `DUP DROP SWAP OVER ROT`, `+ - * NEGATE 0=`, `EMIT KEY`,
     `IF ELSE THEN` and `BEGIN UNTIL` control flow, unmatched words are no-ops
     """
 
     def __init__(
         self,
-        stack_size = 1024,
-        cell_modulus = 256,
-        max_steps = 100_000,
-        max_output_len = 1024,
-        halt_word = 'BYE',
-        unknown_words_are_noops = True,
-        stack_underflow_is_zero = True,
-        random_input = True,
-        case_sensitive = False
+        stack_size = 1024,               # number of cells, extra pushes are dropped
+        cell_modulus = 256,              # every cell is kept modulo this
+        max_steps = 100_000,             # token budget (each word or literal costs 1 step), then halt
+        max_output_len = 1024,           # output byte budget, then halt
+        halt_word = 'BYE',               # tokens from here on are ignored, 'BYE' by default
+        unknown_words_are_noops = True,  # unknown tokens are ignored, else halt
+        stack_underflow_is_zero = True,  # empty stack pops yield zero, else halt
+        random_input = True,             # KEY falls back to uniform random cells, else zeros
+        case_sensitive = False           # tokens are folded to uppercase by default
     ):
         self.stack_size = max(stack_size, 0)
         self.cell_modulus = max(cell_modulus, 1)
@@ -95,12 +85,7 @@ class Forth(Executor):
     def decode(self, ids: list[int]) -> str:
         return ''.join(self.id_to_token[i] for i in ids if i != self.sos_eos_id and i != self.pad_id)
 
-    def __call__(
-        self,
-        program: str,
-        input = '',
-        seed = None
-    ) -> str:
+    def execute(self, program: str, input = '', seed = None) -> ExecutionInfo:
         tokens = program.split() if self.case_sensitive else program.upper().split()
 
         halt_word = self.halt_word if self.case_sensitive or not self.halt_word else self.halt_word.upper()
@@ -111,7 +96,7 @@ class Forth(Executor):
         reads = input_stream(input, self.cell_modulus, seed, self.random_input)
 
         stack, out = [], bytearray()
-        pc = 0
+        pc = steps = loops = 0
 
         def pop():
             if stack:
@@ -130,6 +115,7 @@ class Forth(Executor):
                 if pc >= len(tokens) or len(out) >= self.max_output_len:
                     break
 
+                steps += 1
                 token = tokens[pc]
 
                 match token:
@@ -164,9 +150,13 @@ class Forth(Executor):
                         out.append(pop() % 256)
                     case 'KEY':
                         push(next(reads))
-                    case 'IF' | 'UNTIL':
+                    case 'IF':
                         if pop() == 0:
                             pc = jumps.get(pc, pc)
+                    case 'UNTIL':
+                        if pop() == 0 and pc in jumps:
+                            pc = jumps[pc]
+                            loops += 1
                     case 'ELSE':
                         pc = jumps.get(pc, pc)
                     case 'THEN' | 'BEGIN':
@@ -184,4 +174,9 @@ class Forth(Executor):
         except _Halt:
             pass
 
-        return out.decode('latin-1')
+        return ExecutionInfo(
+            program = program,
+            output = out.decode('latin-1'),
+            steps = steps,
+            loops = loops
+        )
