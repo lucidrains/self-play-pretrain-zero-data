@@ -83,17 +83,48 @@ def test_empty_output_gets_eos_target():
 
     assert [char_decode(row) for row in ids] == strings
 
-def test_forward_with_jvp():
-    model = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4)
+@param('attn_type', ('plain', 'sdpa', 'jvp_flash'))
+def test_attention_types(attn_type):
+    torch.manual_seed(0)
 
-    ids = torch.randint(0, 256, (3, 17))
+    ids = torch.randint(0, 256, (2, 32))
 
-    tangent = {k: torch.randn_like(p) for k, p in model.named_parameters() if p.requires_grad}
+    plain = Transformer(num_tokens = 256, dim = 32, depth = 2, dim_head = 16, heads = 4, attn_type = 'plain')
+
+    expected = plain(ids)
+
+    model = Transformer(num_tokens = 256, dim = 32, depth = 2, dim_head = 16, heads = 4, attn_type = attn_type)
+    model.load_state_dict(plain.state_dict())
+
+    logits = model(ids)
+
+    assert logits.shape == expected.shape == (2, 32, 256)
+    assert torch.allclose(logits, expected, atol = 1e-5)
+
+    loss, loss_mask = model(ids, return_loss = True)
+
+    assert loss.shape == loss_mask.shape == (2, 31)
+
+@param('attn_type', ('plain', 'jvp_flash'))
+def test_forward_with_jvp(attn_type):
+    torch.manual_seed(0)
+
+    ids = torch.randint(0, 256, (3, 33))  # one shifted away for the next token loss, leaving 32
+
+    plain = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4, attn_type = 'plain')
+
+    tangent = {k: torch.randn_like(p) for k, p in plain.named_parameters() if p.requires_grad}
+
+    expected_loss, expected_tangent = plain.forward_with_jvp(ids, tangent)
+
+    model = Transformer(num_tokens = 256, dim = 64, depth = 2, dim_head = 16, heads = 4, attn_type = attn_type)
+    model.load_state_dict(plain.state_dict())
 
     loss, loss_tangent = model.forward_with_jvp(ids, tangent)
 
-    assert loss.shape == (3,)
-    assert loss_tangent.shape == (3,)
+    assert loss.shape == loss_tangent.shape == (3,)
+    assert torch.allclose(loss, expected_loss, atol = 1e-5)
+    assert torch.allclose(loss_tangent, expected_tangent, atol = 1e-5)
 
 class EmptyExecutor(Executor):
     num_tokens = 3

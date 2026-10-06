@@ -29,6 +29,8 @@ from torch_einops_utils.torch_einops_utils import identity
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
+from jvp_flash_attention.jvp_attention import JVPAttn, use_naive_attention
+
 from self_play_pretrain_zero_data.executors import Executor
 
 # constants
@@ -106,13 +108,89 @@ class RMSNorm(Module):
 
 # attention
 
+# three interchangeable backends with a common signature
+# (q, k, v) is (b h n d), the mask is boolean, true lets a key take part
+
+def plain_attention(
+    q, k, v,
+    mask = None,
+    causal = False,
+    scale = None
+):
+    scale = default(scale, q.shape[-1] ** -0.5)
+
+    sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * scale
+
+    # causal mask falls off the bottom right, as the cache offsets the queries
+
+    if causal and not exists(mask):
+        i, j = shape(sim, 'b h [i j]')
+        mask = torch.ones((i, j), dtype = torch.bool, device = q.device).tril(j - i)
+
+    if exists(mask):
+        sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
+
+    return einsum(sim.softmax(dim = -1), v, 'b h i j, b h j d -> b h i d')
+
+def sdpa_attention(
+    q, k, v,
+    mask = None,
+    causal = False,
+    scale = None
+):
+    # is_causal takes no mask
+
+    return F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask = mask,
+        is_causal = causal and not exists(mask),
+        scale = scale
+    )
+
+def jvp_flash_attention(
+    q, k, v,
+    mask = None,
+    causal = False,
+    scale = None
+):
+    # the kernel needs equal q / k lengths, a supported head dim and a sequence length >= 32,
+    # a multiple of 2 on the naive path, otherwise of the block size - else fall back to plain
+
+    seq_len, dim_head = q.shape[-2], q.shape[-1]
+    multiple = 2 if use_naive_attention(q) else 32
+
+    supported = (
+        seq_len == k.shape[-2]
+        and seq_len >= 32 and seq_len % multiple == 0
+        and dim_head in (16, 32, 64, 128, 256)
+    )
+
+    if not supported:
+        return plain_attention(q, k, v, mask = mask, causal = causal, scale = scale)
+
+    # fwd_dual carries torch.func.jvp tangents through the kernel
+
+    return JVPAttn.fwd_dual(
+        q, k, v,
+        attn_mask = mask,
+        causal = causal and not exists(mask),
+        sm_scale = scale
+    )
+
+ATTENTION_FNS = dict(
+    plain = plain_attention,
+    sdpa = sdpa_attention,
+    jvp_flash = jvp_flash_attention
+)
+
 class Attention(Module):
     def __init__(
         self,
         dim,
         *,
         dim_head = 64,
-        heads = 8
+        heads = 8,
+        attn_type = 'plain'
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -125,6 +203,9 @@ class Attention(Module):
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
+        assert attn_type in ATTENTION_FNS, f'unknown attention type {attn_type}'
+        self.attn_fn = ATTENTION_FNS[attn_type]
+
     def forward(
         self,
         x,
@@ -132,8 +213,6 @@ class Attention(Module):
         memory = None,
         return_memory = False
     ):
-        device = x.device
-
         x = self.norm(x)
 
         q, k, v = self.to_qkv(x).chunk(3, dim = -1)
@@ -146,25 +225,21 @@ class Attention(Module):
             q = apply_rotary_emb(rotary_emb, q)
             k = apply_rotary_emb(rotary_emb, k)
 
-        # past keys / values
+        # past keys / values, with the causal mask shifted for the cached tokens
+
+        mask = None
 
         if exists(memory):
             past_k, past_v = memory
             k = cat((past_k, k), dim = -2)
             v = cat((past_v, v), dim = -2)
 
+            i, j = q.shape[-2], k.shape[-2]
+            mask = torch.ones((i, j), dtype = torch.bool, device = q.device).tril(j - i)
+
         # attention
 
-        sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
-
-        i, j = shape(sim, 'b h [i j]')
-        causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
-
-        sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-
-        attn = sim.softmax(dim = -1)
-
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+        out = self.attn_fn(q, k, v, mask = mask, causal = not exists(mask), scale = self.scale)
 
         # merge and combine
 
@@ -216,7 +291,8 @@ class Transformer(Module):
         dim_head = 64,
         heads = 8,
         ff_expansion = 4.,
-        pad_id = -1
+        pad_id = -1,
+        attn_type = 'plain'
     ):
         super().__init__()
 
@@ -233,7 +309,7 @@ class Transformer(Module):
         layers = []
 
         for _ in range(depth):
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads)
+            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, attn_type = attn_type)
             ff = FeedForward(dim = dim, expansion = ff_expansion)
 
             layers.append(ModuleList([attn, ff]))
