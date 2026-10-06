@@ -4,8 +4,11 @@ from dataclasses import dataclass
 from random import choice, choices
 
 import torch
-from torch import Tensor, arange, cat, is_tensor, randint, tensor
+from torch import Tensor, arange, cat, is_tensor, rand, randint, tensor, where, zeros
 from torch.nn import Module
+from torch.nn.functional import pad
+
+from torch_einops_utils import lens_to_mask
 
 from self_play_pretrain_zero_data.executors.base import (
     ExecutionInfo,
@@ -26,47 +29,166 @@ def execution_loops_descriptor(execution: ExecutionInfo):
     return execution.loops
 
 # mutation operators - single token substitutions, insertions or deletions, appendix G of the paper
+# batched over right padded programs - ids (b n) long, mask (b n) bool, true for a real token
+
+def sample_token(shape, num_tokens, device, generator = None):
+    # id 0 is reserved for sos / eos
+    return randint(1, num_tokens, shape, device = device, generator = generator)
+
+def sample_index(count, generator = None):
+    # a uniform index in [0, count) per row
+    return (rand(count.shape, device = count.device, generator = generator) * count).long()
+
+def sample_position(mask, generator = None):
+    # physical index of one uniformly chosen valid token per row, 0 if empty
+    target = sample_index(mask.sum(dim = -1), generator = generator)
+    return (mask.long().cumsum(dim = -1) > target[:, None]).int().argmax(dim = -1)
+
+def substitute_batch(ids, mask, num_tokens, generator = None):
+    # replace one valid token per row, an empty program degrades to an insertion
+
+    if ids.shape[-1] == 0:
+        return insert_batch(ids, mask, num_tokens, generator = generator)
+
+    position = sample_position(mask, generator = generator)[:, None]
+    token = sample_token(ids.shape[:-1], num_tokens, ids.device, generator = generator)[:, None]
+
+    return ids.scatter(-1, position, token), mask.scatter(-1, position, True)
+
+def insert_batch(ids, mask, num_tokens, generator = None):
+    # splice one token into a uniform gap per row
+
+    b, n = ids.shape
+    device = ids.device
+
+    position = sample_index(mask.sum(dim = -1) + 1, generator = generator)
+    token = sample_token(position.shape, num_tokens, device, generator = generator)
+
+    indices = arange(n, device = device)
+    dest = indices + (indices >= position[:, None])
+
+    ids_out = zeros((b, n + 1), dtype = ids.dtype, device = device)
+    mask_out = zeros((b, n + 1), dtype = torch.bool, device = device)
+
+    ids_out.scatter_(1, dest, ids)
+    mask_out.scatter_(1, dest, mask)
+
+    ids_out.scatter_(1, position[:, None], token[:, None])
+    mask_out.scatter_(1, position[:, None], True)
+
+    return ids_out, mask_out
+
+def delete_batch(ids, mask, num_tokens, generator = None):
+    # drop one valid token per row, compacting left, an empty program degrades to an insertion
+
+    if ids.shape[-1] == 0:
+        return insert_batch(ids, mask, num_tokens, generator = generator)
+
+    _, n = ids.shape
+    device = ids.device
+
+    lengths = mask.sum(dim = -1)
+    empty = lengths == 0
+
+    position = sample_position(mask, generator = generator)
+
+    # pull everything after the doomed token one to the left
+
+    indices = arange(n, device = device)
+    src = (indices + (indices >= position[:, None])).clamp(max = n - 1)
+
+    ids = ids.gather(-1, src)
+
+    # an empty program gains a token at the front
+
+    token = sample_token(position.shape, num_tokens, device, generator = generator)
+    ids = where(empty[:, None] & (indices == 0), token[:, None], ids)
+    mask = lens_to_mask(where(empty, 1, lengths - 1), max_len = n)
+
+    return ids, mask
+
+# crossover - k point recombination, segments alternate between the two parents
+
+def crossover_batch(ids_a, mask_a, ids_b, mask_b, num_points = 1, generator = None):
+    b = ids_a.shape[0]
+    device = ids_a.device
+
+    # a dead column keeps the gathers happy even when a parent is empty
+
+    ids_a, mask_a = pad(ids_a, (0, 1)), pad(mask_a, (0, 1))
+    ids_b, mask_b = pad(ids_b, (0, 1)), pad(mask_b, (0, 1))
+
+    n_a, n_b = ids_a.shape[-1], ids_b.shape[-1]
+    lengths_a, lengths_b = mask_a.sum(dim = -1), mask_b.sum(dim = -1)
+
+    def sample_bounds(lengths):
+        # the two endpoints plus k sorted cuts
+        cuts = (rand((b, num_points), device = device, generator = generator) * (lengths + 1)[:, None]).floor().long()
+        return cat((zeros((b, 1), dtype = torch.long, device = device), cuts.sort(dim = -1).values, lengths[:, None]), dim = -1)
+
+    bounds_a, bounds_b = sample_bounds(lengths_a), sample_bounds(lengths_b)
+
+    # output segments alternate between the parents - even segments come from a
+
+    parity = arange(num_points + 1, device = device) % 2
+    seg_lens = where(parity == 0, bounds_a.diff(dim = -1), bounds_b.diff(dim = -1))
+
+    cum = seg_lens.cumsum(dim = -1)
+    out_length = cum[:, -1]
+
+    max_length = int(out_length.max())
+
+    if max_length == 0:
+        return ids_a[:, :0], mask_a[:, :0]
+
+    position = arange(max_length, device = device)
+
+    # the segment each output position belongs to - the first cumulative length to pass it
+
+    seg_id = (cum[:, None, :] > position[None, :, None]).int().argmax(dim = -1)
+
+    local = position[None, :] - pad(cum, (1, 0)).gather(1, seg_id)
+
+    from_a = (seg_id % 2) == 0
+    half = seg_id // 2
+
+    # each segment starts at the cut of its parent
+
+    index_a = (bounds_a[:, 0::2].gather(1, half) + local).clamp(max = n_a - 1)
+    index_b = (bounds_b[:, 1::2].gather(1, half) + local).clamp(max = n_b - 1)
+
+    ids = where(from_a, ids_a.gather(-1, index_a), ids_b.gather(-1, index_b))
+    mask = lens_to_mask(out_length, max_len = max_length)
+
+    return ids, mask
+
+# single program wrappers
+
+def promote(ids):
+    # (n) -> (1 n), all valid
+    return ids[None], ids.new_ones(ids.shape, dtype = torch.bool)[None]
+
+def demote(ids, mask):
+    # (1 n) -> the valid tokens
+    return ids[0][mask[0]]
 
 def substitute(ids, num_tokens, generator = None):
-    if ids.numel() == 0:
-        return insert(ids, num_tokens, generator = generator)
-
-    position = randint(ids.numel(), (1,), device = ids.device, generator = generator)
-    token = randint(1, num_tokens, (1,), device = ids.device, generator = generator)
-
-    return ids.scatter(-1, position, token)
+    return demote(*substitute_batch(*promote(ids), num_tokens, generator = generator))
 
 def insert(ids, num_tokens, generator = None):
-    position = randint(ids.numel() + 1, (1,), device = ids.device, generator = generator)
-    token = randint(1, num_tokens, (1,), device = ids.device, generator = generator)
-
-    return cat((ids[:position], token, ids[position:]))
+    return demote(*insert_batch(*promote(ids), num_tokens, generator = generator))
 
 def delete(ids, num_tokens, generator = None):
-    if ids.numel() == 0:
-        return insert(ids, num_tokens, generator = generator)
-
-    position = randint(ids.numel(), (1,), device = ids.device, generator = generator)
-    keep = arange(ids.numel(), device = ids.device) != position
-
-    return ids[keep]
-
-# crossover - k point recombination
+    return demote(*delete_batch(*promote(ids), num_tokens, generator = generator))
 
 def crossover(ids_a, ids_b, num_points = 1, generator = None):
-    def sample_bounds(ids):
-        cuts = randint(ids.numel() + 1, (num_points,), device = ids.device, generator = generator).sort().values.tolist()
-        return [0, *cuts, ids.numel()]
+    return demote(*crossover_batch(*promote(ids_a), *promote(ids_b), num_points = num_points, generator = generator))
 
-    bounds_a, bounds_b = sample_bounds(ids_a), sample_bounds(ids_b)
-
-    segments = []
-
-    for ind in range(num_points + 1):
-        ids, bounds = (ids_a, bounds_a) if ind % 2 == 0 else (ids_b, bounds_b)
-        segments.append(ids[bounds[ind]:bounds[ind + 1]])
-
-    return cat(segments)
+BATCH_MUTATION_FNS = {
+    substitute: substitute_batch,
+    insert: insert_batch,
+    delete: delete_batch
+}
 
 # entry
 
@@ -224,6 +346,68 @@ class QualityDiversityArchive(Module):
         entries = choice(tuple(self.archive.values()))
 
         return choice(entries)
+
+    def sample_parents(self, num_parents):
+        # parents drawn uniformly across occupied niches, right padded into a batch
+
+        assert num_parents > 0, 'at least one parent is needed'
+        assert len(self.archive) > 0, 'cannot sample mutation parents from an empty archive'
+
+        encoded = [self.to_ids() for _ in range(num_parents)]
+
+        device = encoded[0].device
+        lengths = tensor([ids.numel() for ids in encoded], device = device)
+        max_length = int(lengths.max())
+
+        ids = zeros((num_parents, max_length), dtype = torch.long, device = device)
+        mask = lens_to_mask(lengths, max_len = max_length)
+        ids[mask] = cat(encoded)
+
+        return ids, mask
+
+    def decode_batch(self, ids, mask):
+        return [self.decode(row[:length]) for row, length in zip(ids.tolist(), mask.sum(dim = -1).tolist())]
+
+    def mutate_batch(self, num_mutants = 1):
+        # a batch of local mutations - one weighted operator per mutant
+
+        assert exists(self.num_tokens), 'a vocabulary size is needed to mutate programs'
+
+        ids, mask = self.sample_parents(num_mutants)
+
+        mutation_fns, weights = zip(*self.mutations.items())
+        chosen = tensor(choices(range(len(mutation_fns)), weights = weights, k = num_mutants), device = ids.device)
+
+        width = ids.shape[-1] + 1
+        mutant_ids = ids.new_zeros((num_mutants, width))
+        mutant_mask = ids.new_zeros((num_mutants, width), dtype = torch.bool)
+
+        for op_index, mutation_fn in enumerate(mutation_fns):
+            rows = chosen == op_index
+
+            if not rows.any():
+                continue
+
+            batch_fn = BATCH_MUTATION_FNS.get(mutation_fn)
+            assert exists(batch_fn), f'`{getattr(mutation_fn, "__name__", mutation_fn)}` cannot be applied to a batch'
+
+            op_ids, op_mask = batch_fn(ids[rows], mask[rows], self.num_tokens)
+            mutant_ids[rows, :op_ids.shape[-1]] = op_ids
+            mutant_mask[rows, :op_mask.shape[-1]] = op_mask
+
+        return self.decode_batch(mutant_ids, mutant_mask)
+
+    def crossover_batch(self, num_offspring = 1, num_points = 1):
+        # recombine pairs of parents, k cuts each
+
+        assert exists(self.num_tokens), 'a vocabulary size is needed to crossover programs'
+
+        ids_a, mask_a = self.sample_parents(num_offspring)
+        ids_b, mask_b = self.sample_parents(num_offspring)
+
+        ids, mask = crossover_batch(ids_a, mask_a, ids_b, mask_b, num_points = num_points)
+
+        return self.decode_batch(ids, mask)
 
     def mutate(self, program = None):
         # local mutation of a positively rewarded program

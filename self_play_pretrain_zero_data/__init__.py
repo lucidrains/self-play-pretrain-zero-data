@@ -11,12 +11,16 @@ from self_play_pretrain_zero_data.archive import (
     ArchiveEntry,
     QualityDiversityArchive,
     crossover,
+    crossover_batch,
     delete,
+    delete_batch,
     execution_loops_descriptor,
     execution_steps_descriptor,
     insert,
+    insert_batch,
     program_length_descriptor,
-    substitute
+    substitute,
+    substitute_batch
 )
 
 from self_play_pretrain_zero_data.executors import (

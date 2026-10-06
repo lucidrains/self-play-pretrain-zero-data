@@ -4,12 +4,16 @@ from self_play_pretrain_zero_data import Brainfuck, Forth, NeuralCellularAutomat
 from self_play_pretrain_zero_data.archive import (
     QualityDiversityArchive,
     crossover,
+    crossover_batch,
     delete,
+    delete_batch,
     execution_loops_descriptor,
     execution_steps_descriptor,
     insert,
+    insert_batch,
     program_length_descriptor,
     substitute,
+    substitute_batch,
 )
 
 def test_descriptors_are_derived_from_execution():
@@ -216,3 +220,115 @@ def test_crossover_recombines_tensor_ids():
 
     for _ in range(32):
         assert tuple(crossover(ids_a, ids_b).tolist()) in prefixes_and_suffixes
+
+def test_batch_operators_agree_with_single_program_wrappers():
+    pairs = (
+        (substitute, substitute_batch),
+        (insert, insert_batch),
+        (delete, delete_batch),
+    )
+
+    for single_fn, batch_fn in pairs:
+        ids = torch.tensor([1, 2, 3])
+        mask = torch.ones((1, ids.numel()), dtype = torch.bool)
+
+        single = single_fn(ids, 8, generator = torch.Generator().manual_seed(0))
+        batched, batched_mask = batch_fn(ids[None], mask, 8, generator = torch.Generator().manual_seed(0))
+
+        assert torch.equal(single, batched[0][batched_mask[0]])
+
+    ids_a, ids_b = torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6, 7])
+    mask_a = torch.ones((1, ids_a.numel()), dtype = torch.bool)
+    mask_b = torch.ones((1, ids_b.numel()), dtype = torch.bool)
+
+    single = crossover(ids_a, ids_b, num_points = 2, generator = torch.Generator().manual_seed(0))
+    batched, batched_mask = crossover_batch(ids_a[None], mask_a, ids_b[None], mask_b, num_points = 2, generator = torch.Generator().manual_seed(0))
+
+    assert torch.equal(single, batched[0])
+    assert batched_mask.all()
+
+def test_batched_mutation_operators_only_touch_valid_tokens():
+    ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+
+    generator = torch.Generator().manual_seed(0)
+    sub_ids, sub_mask = substitute_batch(ids, mask, num_tokens = 16, generator = generator)
+
+    assert torch.equal(sub_mask, mask)
+    assert torch.equal(sub_ids[~mask], ids[~mask])  # padding is untouched
+    assert ((sub_ids != ids) & mask).sum(dim = -1).tolist() == [1, 1]
+
+    generator = torch.Generator().manual_seed(0)
+    ins_ids, ins_mask = insert_batch(ids, mask, num_tokens = 16, generator = generator)
+
+    assert ins_ids.shape == (2, 5)
+    assert ins_mask.sum(dim = -1).tolist() == [4, 3]
+
+    for row, length in enumerate(ins_mask.sum(dim = -1).tolist()):
+        original = ids[row][mask[row]].tolist()
+        mutant = ins_ids[row][:length].tolist()
+        assert any(mutant[:i] + mutant[i + 1:] == original for i in range(len(mutant)))
+
+    generator = torch.Generator().manual_seed(0)
+    del_ids, del_mask = delete_batch(ids, mask, num_tokens = 16, generator = generator)
+
+    assert del_mask.sum(dim = -1).tolist() == [2, 1]
+
+    for row, length in enumerate(del_mask.sum(dim = -1).tolist()):
+        original = ids[row][mask[row]].tolist()
+        mutant = del_ids[row][:length].tolist()
+        assert any(mutant == original[:i] + original[i + 1:] for i in range(len(original)))
+
+def test_batched_operators_handle_empty_programs():
+    ids = torch.tensor([[0, 0, 0], [5, 0, 0]])
+    mask = torch.tensor([[False, False, False], [True, False, False]])
+
+    generator = torch.Generator().manual_seed(0)
+    _, sub_mask = substitute_batch(ids, mask, num_tokens = 8, generator = generator)
+
+    generator = torch.Generator().manual_seed(0)
+    _, del_mask = delete_batch(ids, mask, num_tokens = 8, generator = generator)
+
+    assert sub_mask.sum(dim = -1).tolist() == [1, 1]  # an empty program degrades to an insertion
+    assert del_mask.sum(dim = -1).tolist() == [1, 0]
+
+    empty = ids[:, :0]
+    out_ids, out_mask = crossover_batch(empty, empty, ids, mask, generator = generator)
+
+    assert out_ids.shape[0] == 2
+    assert (out_mask.sum(dim = -1) <= mask.sum(dim = -1)).all()
+
+def test_batched_crossover_recombines_every_pair():
+    ids_a = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+    ids_b = torch.tensor([[6, 7, 8, 9], [10, 11, 12, 0]])
+    mask_a, mask_b = ids_a != 0, ids_b != 0
+
+    generator = torch.Generator().manual_seed(0)
+    out_ids, out_mask = crossover_batch(ids_a, mask_a, ids_b, mask_b, num_points = 1, generator = generator)
+
+    for row, length in enumerate(out_mask.sum(dim = -1).tolist()):
+        parent_a = ids_a[row][mask_a[row]].tolist()
+        parent_b = ids_b[row][mask_b[row]].tolist()
+        offspring = out_ids[row][:length].tolist()
+
+        assert any(offspring == parent_a[:i] + parent_b[j:] for i in range(len(parent_a) + 1) for j in range(len(parent_b) + 1))
+
+def test_archive_batch_mutation_and_crossover():
+    executor = Brainfuck()
+    archive = QualityDiversityArchive(executor = executor)
+
+    archive.add('+++.', reward = 1.)
+    archive.add('+++++[->+<]>.', reward = 1.)
+
+    mutants = archive.mutate_batch(16)
+    assert len(mutants) == 16
+    assert any(mutant != '+++.' and mutant != '+++++[->+<]>.' for mutant in mutants)
+
+    for mutant in mutants:
+        executor.encode(mutant)  # raises if a token falls outside the alphabet
+
+    offspring = archive.crossover_batch(16, num_points = 2)
+    assert len(offspring) == 16
+
+    for program in offspring:
+        executor.encode(program)
