@@ -145,4 +145,3 @@ def test_tokenizer():
         ids = nca.encode(program)
         assert all(0 < i < nca.num_tokens for i in ids)
         assert nca.decode(ids) == program
-
