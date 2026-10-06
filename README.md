@@ -6,6 +6,12 @@ Implementation of [Self-Play Pretraining with Zero Data](https://arxiv.org/abs/2
 
 [Paper Review from @hu-po](https://www.youtube.com/watch?v=mGMiiPpWBSo)
 
+## Install
+
+```bash
+$ pip install self-play-pretrain-zero-data
+```
+
 ## Usage
 
 ```python
