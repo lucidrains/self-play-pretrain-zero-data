@@ -10,9 +10,13 @@ from self_play_pretrain_zero_data.self_play import (
 from self_play_pretrain_zero_data.archive import (
     ArchiveEntry,
     QualityDiversityArchive,
+    crossover,
+    delete,
     execution_loops_descriptor,
     execution_steps_descriptor,
-    program_length_descriptor
+    insert,
+    program_length_descriptor,
+    substitute
 )
 
 from self_play_pretrain_zero_data.executors import (
