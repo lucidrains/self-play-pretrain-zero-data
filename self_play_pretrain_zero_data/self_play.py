@@ -29,7 +29,13 @@ from torch_einops_utils.torch_einops_utils import identity
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
-from jvp_flash_attention.jvp_attention import JVPAttn, use_naive_attention
+# jvp flash attention is an optional triton kernel, plain attention stands in when unavailable
+
+try:
+    from jvp_flash_attention.jvp_attention import JVPAttn, use_naive_attention
+    HAS_JVP_FLASH_ATTENTION = True
+except ImportError:
+    HAS_JVP_FLASH_ATTENTION = False
 
 from self_play_pretrain_zero_data.executors import Executor
 
@@ -155,6 +161,9 @@ def jvp_flash_attention(
 ):
     # the kernel needs equal q / k lengths, a supported head dim and a sequence length >= 32,
     # a multiple of 2 on the naive path, otherwise of the block size - else fall back to plain
+
+    if not HAS_JVP_FLASH_ATTENTION:
+        return plain_attention(q, k, v, mask = mask, causal = causal, scale = scale)
 
     seq_len, dim_head = q.shape[-2], q.shape[-1]
     multiple = 2 if use_naive_attention(q) else 32

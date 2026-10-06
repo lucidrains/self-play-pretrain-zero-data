@@ -5,9 +5,22 @@ from torch.optim import AdamW, SGD
 from torch_einops_utils import masked_mean
 
 from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, SelfPlay
-from self_play_pretrain_zero_data.self_play import Transformer, char_decode, char_encode, exists, register_preconditioning, representation_alignment_loss, rewards_to_loss_weights
+from self_play_pretrain_zero_data.self_play import HAS_JVP_FLASH_ATTENTION, Transformer, char_decode, char_encode, exists, register_preconditioning, representation_alignment_loss, rewards_to_loss_weights
+
+try:
+    import triton
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
 
 param = pytest.mark.parametrize
+
+requires_jvp_flash = pytest.mark.skipif(
+    not (HAS_JVP_FLASH_ATTENTION and HAS_TRITON and torch.cuda.is_available()),
+    reason = 'jvp flash attention requires triton and cuda'
+)
+
+jvp_flash_attn = pytest.param('jvp_flash', marks = requires_jvp_flash)
 
 # swap this single param to test a different learner reference end to end
 
@@ -83,7 +96,7 @@ def test_empty_output_gets_eos_target():
 
     assert [char_decode(row) for row in ids] == strings
 
-@param('attn_type', ('plain', 'sdpa', 'jvp_flash'))
+@param('attn_type', ('plain', 'sdpa', jvp_flash_attn))
 def test_attention_types(attn_type):
     torch.manual_seed(0)
 
@@ -105,7 +118,7 @@ def test_attention_types(attn_type):
 
     assert loss.shape == loss_mask.shape == (2, 31)
 
-@param('attn_type', ('plain', 'jvp_flash'))
+@param('attn_type', ('plain', jvp_flash_attn))
 def test_forward_with_jvp(attn_type):
     torch.manual_seed(0)
 
