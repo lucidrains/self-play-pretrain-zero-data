@@ -92,6 +92,20 @@ def test_resubmitting_a_program_updates_the_elite():
     assert len(archive) == 1
     assert next(iter(archive)).reward == 2.
 
+def test_sample_entries_stores_the_sampling_log_prob():
+    archive = QualityDiversityArchive(descriptor_fns = (lambda execution: 0,))
+
+    archive.add('+.', reward = 1., log_prob = -3.)
+
+    entry, = archive.sample_entries(1)
+
+    assert entry.program == '+.'
+    assert entry.log_prob == -3.
+
+    # over-requesting falls back to replacement
+
+    assert len(archive.sample_entries(2)) == 2
+
 def test_remove_program():
     archive = QualityDiversityArchive()
 

@@ -23,6 +23,15 @@ from self_play_pretrain_zero_data.archive import (
     substitute_batch
 )
 
+from self_play_pretrain_zero_data.pool import (
+    POOL_FNS,
+    ProgramBatch,
+    crossover_programs,
+    fresh_programs,
+    mutation_programs,
+    replay_programs
+)
+
 from self_play_pretrain_zero_data.executors import (
     Executor,
     ExecutionInfo,

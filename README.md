@@ -4,7 +4,7 @@
 
 Implementation of [Self-Play Pretraining with Zero Data](https://arxiv.org/abs/2609.30063)
 
-[Paper Review from @hu-po](https://www.youtube.com/watch?v=mGMiiPpWBSo)
+[Paper review by @hu-po](https://www.youtube.com/watch?v=mGMiiPpWBSo)
 
 ## Install
 
@@ -27,6 +27,45 @@ self_play = SelfPlay(generator, learner, executor)
 self_play(epochs = 10)
 
 torch.save(learner.state_dict(), './learner.pt')
+```
+
+## Program Pool
+
+By default the learner trains on programs sampled from the current generator.
+
+The paper (appendix G) mixes three program sources:
+
+- `fresh` - sampled from the current generator
+- `mutation` - an archived program with a small edit
+- `replay` - an archived program, replayed as is
+
+The archive holds the programs mutation and replay draw from. Passing one turns on all three sources with equal weights:
+
+```python
+from self_play_pretrain_zero_data import QualityDiversityArchive
+
+archive = QualityDiversityArchive(executor = executor)
+
+self_play = SelfPlay(
+    generator,
+    learner,
+    executor,
+    archive = archive,
+    proposals = dict(fresh = 1., mutation = 1., replay = 1.)  # default when an archive is passed
+)
+```
+
+Weights control the share of each source, e.g. `fresh = 2., mutation = 1., replay = 1.` draws twice as many fresh programs. A weight of 0 skips the source.
+
+Custom sources are functions returning programs, wrapped with `self_play.program_batch`:
+
+```python
+import random
+
+def uniform_programs(self_play, num_programs, **generation_kwargs):
+    return self_play.program_batch([''.join(random.choice('><+-.,[]') for _ in range(8)) for _ in range(num_programs)])
+
+self_play.proposals = {'fresh': 1., uniform_programs: 1.}
 ```
 
 ## Citations

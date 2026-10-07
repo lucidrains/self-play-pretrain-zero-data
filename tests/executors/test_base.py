@@ -1,5 +1,3 @@
-import torch
-
 from self_play_pretrain_zero_data import CheckpointReference, Executor, SelfPlay
 from self_play_pretrain_zero_data.self_play import Transformer
 
@@ -55,6 +53,6 @@ def test_self_play_accepts_contrived_executor(tmp_path):
         learner_reference = CheckpointReference(folder = tmp_path)
     )
 
-    loss, tangent = self_play(batch_size = 2, max_length = 4, verbose = False, decode_fn = executor.decode)
+    _, tangent = self_play(batch_size = 2, max_length = 4, verbose = False, decode_fn = executor.decode)
 
     assert tangent.shape == (1, 2)

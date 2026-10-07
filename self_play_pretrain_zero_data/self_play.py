@@ -38,18 +38,14 @@ except ImportError:
     HAS_JVP_FLASH_ATTENTION = False
 
 from self_play_pretrain_zero_data.executors import Executor
+from self_play_pretrain_zero_data.executors.base import default, exists
+from self_play_pretrain_zero_data.pool import POOL_FNS, ProgramBatch, fresh_programs
 
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
 
 # helpers
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
 
 def pick(d, keys):
     return tuple(d[key] for key in keys)
@@ -432,17 +428,17 @@ class Transformer(Module):
             if isin(out[:, prompt_len:], termination_ids).any(dim = -1).all():
                 break
 
-        # mask first terminator and after, generated region only
+        # keep the first terminator, mask everything after it - generated region only
 
         generated = out[:, prompt_len:]
 
-        terminated = isin(generated, termination_ids).cumsum(dim = -1) > 0
+        after_terminator = isin(generated, termination_ids).cumsum(dim = -1) > 1
 
-        generated.masked_fill_(terminated, pad_value)
+        generated.masked_fill_(after_terminator, pad_value)
 
-        # generated lengths, excluding the terminator
+        # generated lengths, including the terminator, so log probs cover the whole program
 
-        gen_lens = (~terminated).sum(dim = -1)
+        gen_lens = (~after_terminator).sum(dim = -1)
 
         seq_mask = pad_left_at_dim(lens_to_mask(gen_lens, max_len = size(out, '... [n]') - prompt_len), prompt_len)
 
@@ -758,6 +754,7 @@ class SelfPlay(Module):
         generator: Module,
         learner: Module,
         executor: Executor,
+        archive = None,
         accelerator = None,
         cpu = False,
         learned_tokenizer_encode = None,
@@ -772,7 +769,8 @@ class SelfPlay(Module):
         generator_max_grad_norm = 1.,
         expert_iter_loss_weight = 1.0,
         representation_alignment_loss_weight = 0.0,
-        learner_reference = None
+        learner_reference = None,
+        proposals = None
     ):
         super().__init__()
 
@@ -788,6 +786,23 @@ class SelfPlay(Module):
         self.generator = generator
         self.learner = learner
         self.executor = executor
+
+        # quality diversity archive, the source of mutation parents and replays
+
+        self.archive = archive
+
+        # program pool - pool name or fn -> share of each batch, appendix G
+        # any callable of (self_play, num_programs, **generation_kwargs) -> ProgramBatch | None
+
+        if not exists(proposals):
+            proposals = dict(fresh = 1., mutation = 1., replay = 1.) if exists(archive) else dict(fresh = 1.)
+        elif isinstance(proposals, (list, tuple)):
+            proposals = {name: 1. for name in proposals}
+
+        assert len(proposals) > 0, 'at least one program pool is needed'
+        assert sum(proposals.values()) > 0., 'program pool weights must sum to a positive value'
+
+        self.proposals = proposals
 
         # default learner tokenizer
 
@@ -928,25 +943,27 @@ class SelfPlay(Module):
             return masked_sum(log_probs, seq_mask, dim = -1)
 
         # uniform prior over programs - shorter programs are more likely
+        # g0(x) = |A| ** -l(x), with l(x) up to and including the terminator and token id 0 excluded
 
         generator = self.unwrapped_generator
 
-        lens = seq_mask.sum(dim = -1) + (replay_ids == generator.pad_id).any(dim = -1)
+        lens = seq_mask.sum(dim = -1)
 
-        return -lens * math.log(generator.num_tokens)
+        return -lens * math.log(generator.num_tokens - 1)
 
     @move_inputs_to_module_device
     def grpo_loss(
         self,
         rewards,         # (b)
         *,
-        old_log_probs,   # (b n)
+        old_log_probs,   # (b) sequence level proposal log probs
         replay_ids,      # (b n)
         prompt_len = 1,  # 1 for start token
         log_ratio_clamp = (-20., 20.),
         length_normalize = False,
         length_normalize_kl = False,
         seq_mask = None,
+        pg_mask = None,  # (b) rows entering the policy gradient, mutations excluded
         kl_loss_weight = 1.,
         prior_generator = None,
     ):
@@ -964,7 +981,9 @@ class SelfPlay(Module):
         token_log_probs = batched_index_select(replay_log_probs, replay_ids, dim = -1)
 
         log_probs = masked_sum(token_log_probs, seq_mask, dim = -1)
-        old_log_probs = masked_sum(old_log_probs, seq_mask, dim = -1)
+
+        if old_log_probs.ndim == 2:
+            old_log_probs = masked_sum(old_log_probs, seq_mask, dim = -1)
 
         # advantage - normalized rewards minus the kl to the generator prior
 
@@ -986,9 +1005,14 @@ class SelfPlay(Module):
 
         ratio = (log_probs - old_log_probs).mul(ratio_mult).clamp(*log_ratio_clamp).exp()
 
-        # grpo loss
+        # mutation rows carry no proposal log prob, out of the mean
 
-        grpo_loss = -(ratio * advantages).mean()
+        row_loss = -(ratio * advantages)
+
+        if exists(pg_mask):
+            grpo_loss = masked_mean(row_loss, pg_mask, dim = -1)
+        else:
+            grpo_loss = row_loss.mean()
 
         return grpo_loss, (normed_rewards, kl_to_prior), log_probs
 
@@ -1002,6 +1026,96 @@ class SelfPlay(Module):
         weights = rewards_to_loss_weights(rewards)
 
         return -(weights * log_probs).sum()
+
+    @torch.no_grad()
+    def program_batch(self, programs, old_log_probs = None, *, pg = True, admit = False):
+        # programs -> sos + ids batch, teacher forcing the generator when no proposal log prob is stored
+
+        if len(programs) == 0:
+            return None
+
+        generator = self.unwrapped_generator
+        device = self.device
+
+        sos = tensor([self.executor.sos_eos_id], dtype = torch.long, device = device)
+
+        rows = [cat((sos, tensor(self.executor.encode(program), dtype = torch.long, device = device))) for program in programs]
+
+        decoded_ids, lengths = pad_sequence(rows, value = generator.pad_id, return_lens = True)
+
+        seq_mask = lens_to_mask(lengths, max_len = size(decoded_ids, 'b [n]'))
+        seq_mask[:, 0] = False
+
+        b = len(programs)
+
+        if exists(old_log_probs):
+            old_log_probs = old_log_probs.to(device)
+        elif pg:
+            # no stored proposal log prob, current pre-update generator stands in, ratio of one
+
+            logits = generator(decoded_ids, return_loss = False)
+            token_log_probs = batched_index_select(logits.log_softmax(dim = -1), decoded_ids.clamp_min(0), dim = -1)
+
+            old_log_probs = masked_sum(token_log_probs, seq_mask, dim = -1)
+        else:
+            old_log_probs = torch.zeros(b, device = device)
+
+        return ProgramBatch(
+            programs = programs,
+            decoded_ids = decoded_ids,
+            seq_mask = seq_mask,
+            old_log_probs = old_log_probs,
+            pg_mask = torch.full((b,), pg, dtype = torch.bool, device = device),
+            admit = torch.full((b,), admit, dtype = torch.bool, device = device)
+        )
+
+    def sample_pool(self, batch_size, **generation_kwargs):
+        # exact source shares, fresh samples claim the slots a source cannot fill
+        # names resolve through the pool dict, custom callables pass through
+
+        fns = [POOL_FNS.get(fn, fn) for fn in self.proposals]
+        weights = list(self.proposals.values())
+
+        exact = tensor(weights, dtype = torch.float)
+        exact = exact / exact.sum() * batch_size
+
+        counts = exact.floor().long()
+        leftover = batch_size - int(counts.sum())
+
+        if leftover > 0:
+            counts[exact.frac().topk(leftover).indices] += 1
+
+        batches = [fn(self, count, **generation_kwargs) for fn, count in zip(fns, counts.tolist()) if count > 0]
+        batches = [batch for batch in batches if exists(batch)]
+
+        shortfall = batch_size - sum(len(batch) for batch in batches)
+
+        if shortfall > 0:
+            batches.append(fresh_programs(self, shortfall, **generation_kwargs))
+
+        return ProgramBatch.concat(batches, pad_id = self.unwrapped_generator.pad_id)
+
+    @torch.no_grad()
+    def update_archive(self, batch: ProgramBatch, execution_infos, rewards, log_probs):
+        # admit fresh and mutated programs with their generator log prob, then age the archive
+
+        assert exists(self.archive), 'no archive to update'
+
+        rewards = rewards.tolist() if is_tensor(rewards) else rewards
+        admitted = batch.admit.tolist() if is_tensor(batch.admit) else batch.admit
+        log_probs = log_probs.tolist() if is_tensor(log_probs) else log_probs
+
+        for program, execution_info, reward, admit, log_prob in zip(
+            batch.programs,
+            execution_infos,
+            rewards,
+            admitted,
+            log_probs
+        ):
+            if admit:
+                self.archive.add(program, reward, execution_info = execution_info, log_prob = log_prob)
+
+        self.archive.advance_age()
 
     def forward(
         self,
@@ -1026,26 +1140,24 @@ class SelfPlay(Module):
         loss_tangents = []
 
         for _ in range(epochs):
-            # generate a batch of decoded programs, listening for eos
-
-            eos_ids = tuple(eid for eid in (self.executor.sos_eos_id, self.executor.halt_id) if exists(eid))
-
             generator, learner = self.unwrapped_generator, self.unwrapped_learner
 
-            programs, program_generate_intermediates = generator.generate(
-                batch_size = batch_size,
+            # program pool - fresh samples, mutations, replays, appendix G
+
+            batch = self.sample_pool(
+                batch_size,
                 max_length = max_length,
                 temperature = temperature,
                 filter_thres = filter_thres,
-                sos_id = self.executor.sos_eos_id,
-                eos_ids = eos_ids,
-                decode_fn = decode_fn,
-                return_for_policy_optimization = True
+                decode_fn = decode_fn
             )
 
-            # execute the programs
+            programs = batch.programs
 
-            outputs = [self.executor(program) for program in programs]
+            # execute, keeping the execution info for the archive descriptors
+
+            execution_infos = [self.executor.execute(program) for program in programs]
+            outputs = [info.output for info in execution_infos]
 
             if verbose:
                 for program, output in zip(programs, outputs):
@@ -1060,7 +1172,7 @@ class SelfPlay(Module):
             alignment_loss_weight = self.representation_alignment_loss_weight
 
             if alignment_loss_weight > 0.:
-                program_ids = program_generate_intermediates.decoded_ids
+                program_ids = batch.decoded_ids
 
                 with torch.no_grad():
                     _, generator_repr = generator(program_ids, return_pooled_repr = True)
@@ -1097,20 +1209,16 @@ class SelfPlay(Module):
 
             rewards = loss_tangent.abs()
 
-            program_ids = program_generate_intermediates.decoded_ids
-            old_log_probs = program_generate_intermediates.old_log_probs
-            prompt_len = program_generate_intermediates.prompt_len
-
-            rl_loss, rl_loss_breakdown, program_log_probs = self.grpo_loss(
+            rl_loss, _, program_log_probs = self.grpo_loss(
                 rewards,
-                replay_ids = program_ids,
-                old_log_probs = old_log_probs,
-                prompt_len = prompt_len,
-                seq_mask = program_generate_intermediates.seq_mask,
+                replay_ids = batch.decoded_ids,
+                old_log_probs = batch.old_log_probs,
+                seq_mask = batch.seq_mask,
+                pg_mask = batch.pg_mask,
                 prior_generator = self.generator_prior
             )
 
-            # expert iter - reward weighted sft on the same programs
+            # expert iter - reward weighted sft over the full pool
 
             ei_loss = self.expert_iter_loss(rewards, program_log_probs)
             generator_loss = rl_loss + self.expert_iter_loss_weight * ei_loss
@@ -1122,6 +1230,11 @@ class SelfPlay(Module):
 
             self.generator_optimizer.step()
             self.generator_optimizer.zero_grad()
+
+            # admit fresh and mutated programs back
+
+            if exists(self.archive):
+                self.update_archive(batch, execution_infos, rewards, program_log_probs)
 
             # accumulate
 

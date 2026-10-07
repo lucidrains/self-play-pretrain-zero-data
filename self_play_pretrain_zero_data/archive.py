@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from random import choice, choices
+from random import choice, choices, sample
 
 import torch
 from torch import Tensor, arange, cat, is_tensor, rand, randint, tensor, where
@@ -203,6 +203,7 @@ class ArchiveEntry:
     execution_info: ExecutionInfo
     age: int = 0
     ids: Tensor | None = None
+    log_prob: float | None = None  # sampling log prob at entry, the replay ratio denominator
 
     @property
     def output(self):
@@ -280,7 +281,7 @@ class QualityDiversityArchive(Module):
     def derive_descriptors(self, execution: ExecutionInfo):
         return tuple(fn(execution) for fn in self.descriptor_fns)
 
-    def add(self, program: str, reward: float, execution_info: ExecutionInfo | None = None):
+    def add(self, program: str, reward: float, execution_info: ExecutionInfo | None = None, log_prob: float | None = None):
         # only positively rewarded programs are admitted
 
         if reward <= 0.:
@@ -291,7 +292,7 @@ class QualityDiversityArchive(Module):
 
         entries = self.archive.setdefault(self.derive_descriptors(execution_info), [])
         ids = self.encode(program) if exists(self.encode_fn) else None
-        entry = ArchiveEntry(program, reward, execution_info, ids = ids)
+        entry = ArchiveEntry(program, reward, execution_info, ids = ids, log_prob = log_prob)
 
         # an improved resubmission replaces the elite
 
@@ -301,6 +302,7 @@ class QualityDiversityArchive(Module):
                     return False
 
                 entries[i] = entry
+                entries.sort(key = lambda entry: entry.reward, reverse = True)
                 return True
 
         if len(entries) < self.max_programs_per_niche:
@@ -361,6 +363,17 @@ class QualityDiversityArchive(Module):
         mask = lens_to_mask(lengths, max_len = size(ids, 'b [n]'))
 
         return ids, mask
+
+    def sample_entries(self, num_entries):
+        # replay sampling - uniform over programs, not niches, without replacement when possible
+
+        entries = list(self)
+        assert len(entries) > 0, 'cannot sample replay programs from an empty archive'
+
+        if num_entries <= len(entries):
+            return sample(entries, k = num_entries)
+
+        return choices(entries, k = num_entries)
 
     def decode_batch(self, ids, mask):
         # strip padding, then decode each row

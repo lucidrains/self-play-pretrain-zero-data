@@ -1,3 +1,6 @@
+import math
+from importlib.util import find_spec
+
 import pytest
 import torch
 from torch.optim import AdamW, SGD
@@ -7,11 +10,7 @@ from torch_einops_utils import masked_mean
 from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, SelfPlay
 from self_play_pretrain_zero_data.self_play import HAS_JVP_FLASH_ATTENTION, Transformer, char_decode, char_encode, exists, register_preconditioning, representation_alignment_loss, rewards_to_loss_weights
 
-try:
-    import triton
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
+HAS_TRITON = find_spec('triton') is not None
 
 param = pytest.mark.parametrize
 
@@ -246,6 +245,60 @@ def test_generate_seq_mask_matches_derived_mask():
         derived[:, :info.prompt_len] = False
 
         assert (derived == info.seq_mask).all()
+
+def test_generate_seq_mask_includes_terminator():
+    torch.manual_seed(0)
+
+    model = Transformer(num_tokens = 16, dim = 16, depth = 1, dim_head = 8, heads = 2)
+
+    halt_id = 3
+
+    def only_halt(logits, _):
+        mask = torch.arange(logits.shape[-1], device = logits.device) == halt_id
+        return logits.masked_fill(~mask, -torch.finfo(logits.dtype).max)
+
+    _, info = model.generate(
+        batch_size = 2,
+        max_length = 4,
+        filter_logits_fn = only_halt,
+        filter_thres = 1.,
+        eos_ids = (halt_id,),
+        mask_out_eos_on_first_step = False,
+        return_for_policy_optimization = True
+    )
+
+    # the terminator is the last content token, giving a program log prob up to and including it
+
+    assert (info.decoded_ids[:, info.prompt_len] == halt_id).all()
+    assert info.seq_mask[:, info.prompt_len].all()
+    assert (info.seq_mask.sum(dim = -1) == 1).all()
+
+def test_uniform_prior_uses_program_alphabet_size(tmp_path):
+    torch.manual_seed(0)
+
+    executor = Brainfuck()
+
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2)
+    learner = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
+
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        learner_reference = CheckpointReference(folder = tmp_path)
+    )
+
+    # a terminated three token program, terminator included in the mask
+
+    seq_mask = torch.tensor([[True, True, True, False]])
+    replay_ids = torch.tensor([[1, 2, executor.halt_id, -1]])
+
+    log_prob = self_play.prior_log_probs(replay_ids, seq_mask)
+
+    alphabet_size = len(executor.alphabet)
+
+    assert alphabet_size == executor.num_tokens - 1
+    assert torch.allclose(log_prob, torch.tensor([-3. * math.log(alphabet_size)]))
 
 @param('reference_fn', reference_fns.values(), ids = reference_fns.keys())
 @param('executor_type', (Brainfuck, Forth, NeuralCellularAutomata))

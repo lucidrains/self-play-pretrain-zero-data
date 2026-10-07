@@ -1,6 +1,6 @@
 [project]
 name = "self-play-pretrain-zero-data"
-version = "0.0.23"
+version = "0.0.24"
 description = "Implementation of Self-Play Pretraining with Zero Data"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -29,7 +29,7 @@ dependencies = [
     "einops>=0.8.1",
     "einx>=0.4.0",
     "ema-pytorch>=0.8.3",
-    "jvp_flash_attention @ git+https://github.com/lucidrains/jvp_flash_attention.git@main",
+    "jvp-flash-attention-lucidrains-fork",
     "rotary-embedding-torch",
     "torch>=2.5",
     "torch-einops-utils>=0.1.36",
