@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from copy import deepcopy
 
 from functools import partial
-from math import ceil
 from pathlib import Path
 
 import math
@@ -45,11 +44,6 @@ from self_play_pretrain_zero_data.pool import POOL_FNS, ProgramBatch, fresh_prog
 
 LinearNoBias = partial(Linear, bias = False)
 
-# helpers
-
-def pick(d, keys):
-    return tuple(d[key] for key in keys)
-
 # rewards to expert iteration weights - section 2.2 of the paper, w_i in the generator objective (eq. 5)
 
 def rewards_to_loss_weights(
@@ -81,7 +75,7 @@ def gumbel_noise_like(t):
 def top_k(logits, thres = 0.9):
     num_tokens = size(logits, '... [v]')
 
-    k = clamp(ceil((1. - thres) * num_tokens), lo = 1, hi = num_tokens)
+    k = clamp(math.ceil((1. - thres) * num_tokens), lo = 1, hi = num_tokens)
 
     val, ind = torch.topk(logits, k)
     probs = torch.full_like(logits, float('-inf'))
@@ -633,8 +627,8 @@ def char_decode(ids, add_zero_sos_eos_id = True):
 # default learner preconditioning - the diagonal AdamW step operator
 
 def adam_preconditioning(param, state, param_group):
-    lr, eps, (_, beta2) = pick(param_group, ('lr', 'eps', 'betas'))
-    exp_avg_sq, step = pick(state, ('exp_avg_sq', 'step'))
+    lr, eps, (_, beta2) = (param_group[key] for key in ('lr', 'eps', 'betas'))
+    exp_avg_sq, step = (state[key] for key in ('exp_avg_sq', 'step'))
 
     step = step.item() if is_tensor(step) else step
 

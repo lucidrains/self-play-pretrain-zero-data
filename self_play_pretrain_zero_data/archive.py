@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from random import choice, choices, sample
 
 import torch
@@ -258,6 +258,35 @@ class QualityDiversityArchive(Module):
 
     def __iter__(self):
         return iter(entry for entries in self.archive.values() for entry in entries)
+
+    def save(self, path):
+        # entries as plain tuples, weights only loadable
+
+        state = dict(
+            entries = [(niche, [astuple(entry) for entry in entries]) for niche, entries in self.archive.items()],
+            reward_decay = self.reward_decay,
+            max_age = self.max_age
+        )
+
+        torch.save(state, path)
+        return self
+
+    def load(self, path):
+        # execution info rebuilds from the stored tuples, aging continues where it left off
+
+        state = torch.load(path, map_location = 'cpu', weights_only = True)
+
+        self.archive = {
+            tuple(niche): [
+                ArchiveEntry(program, reward, ExecutionInfo(*info), age, ids = ids, log_prob = log_prob)
+                for program, reward, info, age, ids, log_prob in entries
+            ]
+            for niche, entries in state['entries']
+        }
+        self.reward_decay = state['reward_decay']
+        self.max_age = state['max_age']
+
+        return self
 
     def encode(self, program: str):
         assert exists(self.encode_fn), 'an encode function is needed to encode a program'

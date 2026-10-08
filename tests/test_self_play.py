@@ -7,7 +7,7 @@ from torch.optim import AdamW, SGD
 
 from torch_einops_utils import masked_mean
 
-from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, SelfPlay
+from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, QualityDiversityArchive, SelfPlay
 from self_play_pretrain_zero_data.self_play import HAS_JVP_FLASH_ATTENTION, Transformer, char_decode, char_encode, exists, register_preconditioning, representation_alignment_loss, rewards_to_loss_weights
 
 HAS_TRITON = find_spec('triton') is not None
@@ -354,3 +354,32 @@ def test_self_play(reference_fn, optimizer_type, executor_type, tmp_path):
     for name, param in learner.named_parameters():
         if param.requires_grad:
             assert preconditioning[name].shape == param.shape
+
+def test_self_play_archives_age_every_epoch():
+    torch.manual_seed(0)
+
+    executor = Brainfuck()
+
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 32, depth = 1, dim_head = 8, heads = 4)
+    learner = Transformer(num_tokens = 256 + 1, dim = 32, depth = 1, dim_head = 8, heads = 4)
+
+    archive = QualityDiversityArchive(executor = executor, reward_decay = 0.5)
+
+    # seed the archive - a full self play epoch must age the entry and decay its reward
+
+    assert archive.add('+.', reward = 4., execution_info = executor.execute('+.'))
+
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        archive = archive,
+        learner_reference = EMAReference(decay = 0.99)
+    )
+
+    self_play(batch_size = 2, max_length = 8, verbose = False, epochs = 1, decode_fn = executor.decode)
+
+    entry = next(entry for entry in archive if entry.program == '+.')
+
+    assert entry.age == 1
+    assert entry.reward == 2.

@@ -130,6 +130,30 @@ def test_age_expiration_decays_and_evicts():
 
     assert len(archive) == 0
 
+def test_save_load_roundtrip(tmp_path):
+    executor = Brainfuck()
+    archive = QualityDiversityArchive(executor = executor, reward_decay = 0.5, max_age = 3)
+
+    archive.add('+++.', reward = 2., log_prob = -3.)
+    archive.add('+.', reward = 4.)
+
+    path = tmp_path / 'archive.pt'
+    archive.save(path)
+
+    loaded = QualityDiversityArchive(executor = executor).load(path)
+
+    assert loaded.reward_decay == 0.5
+    assert loaded.max_age == 3
+
+    def snapshot(a):
+        return {
+            (niche, entry.program): (entry.reward, entry.output, entry.age, entry.log_prob, entry.ids.tolist() if entry.ids is not None else None)
+            for niche, entries in a.archive.items()
+            for entry in entries
+        }
+
+    assert snapshot(loaded) == snapshot(archive)
+
 def test_mutation_produces_executable_programs():
     cases = (
         (Brainfuck(), '+++[->+<].'),
