@@ -221,3 +221,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# experiment run artifacts
+experiments/runs/
+experiments/**/__pycache__/

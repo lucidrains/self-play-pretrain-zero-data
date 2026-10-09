@@ -327,6 +327,10 @@ class Transformer(Module):
     def trainable_parameter_names(self):
         return {name for name, param in self.named_parameters() if param.requires_grad}
 
+    @property
+    def num_parameters(self):
+        return sum(parameter.numel() for parameter in self.parameters())
+
     @torch.no_grad()
     @temp_eval
     def generate(
