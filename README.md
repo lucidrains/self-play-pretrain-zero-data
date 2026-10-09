@@ -118,3 +118,11 @@ self_play.proposals = {'fresh': 1., uniform_programs: 1.}
     url      = {https://arxiv.org/abs/2603.10055},
 }
 ```
+
+## Replication script
+
+Self-play discovers arithmetic, geometric and fibonacci programs from zero data, far above uniform sampling, with the dashboard opening automatically.
+
+```bash
+$ uv run experiments/replicate_table1.py
+```

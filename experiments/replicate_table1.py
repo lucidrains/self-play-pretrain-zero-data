@@ -4,12 +4,12 @@ trains a generator / learner pair for the selected executor, checks fresh genera
 samples every round with the appendix C family detector, compares against uniform
 sampling, and streams live.json for the monitor
 
-  python experiments/replicate_table1.py --minutes 30       # brainfuck, ema reference
-  python experiments/replicate_table1.py --executor forth --minutes 30
-  python experiments/replicate_table1.py --reference checkpoint   # paper lookback
+  python experiments/replicate_table1.py                    # brainfuck, checkpoint lookback, dashboard auto opens
+  python experiments/replicate_table1.py --executor forth
+  python experiments/replicate_table1.py --reference ema           # moving average reference
   python experiments/monitor.py --live experiments/runs/default/live.json
-  # ablations: --ablate-generator frozen, --ablate-reward shuffle|negate, --ablate-proposals fresh
-  # warm start: --resume-generator/-learner/-archive RUN/generator.pt for a finished run
+  # ablations: --ablate_generator=frozen, --ablate_reward=shuffle|negate, --ablate_proposals=fresh
+  # warm start: --resume_generator/-learner/-archive RUN/generator.pt for a finished run
 """
 
 from __future__ import annotations
@@ -19,7 +19,10 @@ import json
 import os
 import random
 import sys
+import threading
 import time
+import webbrowser
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from families import FAMILIES, expected_first_round, family_of, uniform_baseline
 from fire import Fire
+from monitor import make_server
 from report import make_plot, print_summary
 
 from self_play_pretrain_zero_data import (
@@ -73,9 +77,9 @@ def byte_head(string, count = 16):
 def live_snapshot(config, start, round_idx, losses, discoveries, archive, baseline_hits, recent, sample_hits, num_parameters = 0, finished = False):
     expected_round = {family: expected_first_round(baseline_hits[family], config.baseline_samples, config.detect_samples)[0] for family in FAMILIES}
 
-    archive_rows = [dict(program = entry.program, reward = round(entry.reward, 3), age = entry.age, length = len(entry.program), loops = entry.execution_info.loops,
+    archive_rows = [dict(program = entry.program, reward = round(entry.learn_reward, 3), age = entry.age, length = len(entry.program), loops = entry.execution_info.loops,
                          output_head = byte_head(entry.execution_info.output), family = family_of(entry.execution_info.output, config.max_output))
-                    for entry in heapq.nlargest(64, archive, key = lambda entry: entry.reward)]
+                    for entry in heapq.nlargest(64, archive, key = lambda entry: entry.learn_reward)]
 
     return dict(
         status = 'finished' if finished else 'running',
@@ -99,9 +103,22 @@ def write_live(path, snapshot):
     temp.write_text(json.dumps(snapshot))
     temp.replace(path)
 
+def launch_dashboard(live_path, host = '127.0.0.1'):
+    # ephemeral port, so parallel runs each get their own dashboard
+
+    server = make_server(live_path, host, port = 0)
+    threading.Thread(target = server.serve_forever, daemon = True).start()
+
+    url = f'http://{host}:{server.server_address[1]}'
+    print(f'dashboard {url}', flush = True)
+
+    # headless machines have no browser to open
+
+    with suppress(webbrowser.Error):
+        webbrowser.open(url)
+
 def train(
     rounds = 2000,
-    minutes = 30.,
     batch_size = 64,
     detect_samples = 256,
     max_length = 32,
@@ -126,8 +143,9 @@ def train(
     kl_weight = 0.01,
     length_normalize_kl = True,
     normalize_combined_advantage = True,
-    representation_alignment_loss_weight = 0.0,
+    representation_alignment_loss_weight = 0.01,
     bucketed_archive = False,
+    dashboard = True,
     device = 'cpu',
     resume_generator = None,
     resume_learner = None,
@@ -209,13 +227,16 @@ def train(
 
     save()
 
+    if config.dashboard:
+        launch_dashboard(out / 'live.json')
+
     if config.baseline_samples > 0:
         baseline_hits = uniform_baseline(executor, config.baseline_samples, config.seed, workers = config.threads)
         save()
 
     print(f'uniform baseline over {config.baseline_samples} programs -> {baseline_hits}', flush = True)
 
-    while round_idx < config.rounds and (time.time() - start) / 60. < config.minutes:
+    while round_idx < config.rounds:
         loss = self_play(batch_size = config.batch_size, max_length = config.max_length, verbose = False, epochs = 1, decode_fn = executor.decode, filter_thres = 0.)[0].item()
         losses.append(loss)
 

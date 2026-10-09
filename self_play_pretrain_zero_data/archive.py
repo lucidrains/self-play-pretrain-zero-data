@@ -204,6 +204,10 @@ class ArchiveEntry:
     age: int = 0
     ids: Tensor | None = None
     log_prob: float | None = None  # sampling log prob at entry, the replay ratio denominator
+    learn_reward: float | None = None  # reward at admission, before the aging decay
+
+    def __post_init__(self):
+        self.learn_reward = default(self.learn_reward, self.reward)
 
     @property
     def output(self):
@@ -276,11 +280,15 @@ class QualityDiversityArchive(Module):
 
         state = torch.load(path, map_location = 'cpu', weights_only = True)
 
+        def rebuild(row):
+            # older saves carry six fields, learn_reward was appended
+
+            program, reward, info, age, ids, log_prob, *rest = (*row, None)
+
+            return ArchiveEntry(program, reward, ExecutionInfo(*info), age, ids = ids, log_prob = log_prob, learn_reward = rest[0])
+
         self.archive = {
-            tuple(niche): [
-                ArchiveEntry(program, reward, ExecutionInfo(*info), age, ids = ids, log_prob = log_prob)
-                for program, reward, info, age, ids, log_prob in entries
-            ]
+            tuple(niche): [rebuild(row) for row in entries]
             for niche, entries in state['entries']
         }
         self.reward_decay = state['reward_decay']

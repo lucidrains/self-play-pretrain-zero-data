@@ -8,6 +8,7 @@ appendix C family tags, and the latest generator proposals
 
 from __future__ import annotations
 
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -182,7 +183,7 @@ function render(s) {
   if (c.ablate_proposals !== 'none') flags.push(`proposals=${c.ablate_proposals}`);
   $('ablate').textContent = flags.length ? `ablate · ${flags.join(' · ')}` : '';
   $('dot').className = 'dot' + (s.status === 'finished' ? '' : ' run');
-  $('stats').textContent = `round ${fmt(s.round)} · ${(+s.elapsed_min).toFixed(1)}/${c.minutes} min · loss ${last == null ? '—' : last.toFixed(3)} · archive ${fmt(s.archive_size)} · ${c.detect_samples}/round`;
+  $('stats').textContent = `round ${fmt(s.round)} · ${(+s.elapsed_min).toFixed(1)} min · loss ${last == null ? '—' : last.toFixed(3)} · archive ${fmt(s.archive_size)} · ${c.detect_samples}/round`;
   $('scope').textContent = '· mod 256 recurrences, period ≥ 30';
   renderDiscoveries(s); renderRecent(s); renderArchive(s); drawLoss(s);
 }
@@ -223,17 +224,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+def make_server(live, host = '127.0.0.1', port = 0):
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.live_path = Path(live)
+    return server
+
 def serve(
     live = 'experiments/runs/default/live.json',
     host = '127.0.0.1',
     port = 8000,
-    label = None
+    label = None,
+    open_browser = False
 ):
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.live_path = Path(live)
+    server = make_server(live, host, port)
     server.label = default(label, server.live_path.parent.name)
 
-    print(f'monitor on http://{host}:{port} - watching {server.live_path} (label {server.label})')
+    url = f'http://{host}:{server.server_address[1]}'
+
+    print(f'monitor on {url} - watching {server.live_path} (label {server.label})')
+
+    if open_browser:
+        webbrowser.open(url)
 
     try:
         server.serve_forever()
