@@ -8,9 +8,10 @@ appendix C family tags, and the latest generator proposals
 
 from __future__ import annotations
 
-import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from fire import Fire
 
 from self_play_pretrain_zero_data.executors.base import default
 
@@ -222,20 +223,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-def main():
-    parser = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--live', type = str, default = 'experiments/runs/default/live.json')
-    parser.add_argument('--host', type = str, default = '127.0.0.1')
-    parser.add_argument('--port', type = int, default = 8000)
-    parser.add_argument('--label', type = str)
+def serve(
+    live = 'experiments/runs/default/live.json',
+    host = '127.0.0.1',
+    port = 8000,
+    label = None
+):
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.live_path = Path(live)
+    server.label = default(label, server.live_path.parent.name)
 
-    args = parser.parse_args()
-
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.live_path = Path(args.live)
-    server.label = default(args.label, server.live_path.parent.name)
-
-    print(f'monitor on http://{args.host}:{args.port} - watching {server.live_path} (label {server.label})')
+    print(f'monitor on http://{host}:{port} - watching {server.live_path} (label {server.label})')
 
     try:
         server.serve_forever()
@@ -243,4 +241,4 @@ def main():
         pass
 
 if __name__ == '__main__':
-    main()
+    Fire(serve)

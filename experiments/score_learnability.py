@@ -11,7 +11,6 @@ usage: python experiments/score_learnability.py --results experiments/runs/table
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import random
@@ -19,6 +18,7 @@ import time
 from pathlib import Path
 
 import torch
+from fire import Fire
 from torch.optim import AdamW
 from torch_einops_utils import masked_mean
 
@@ -162,28 +162,26 @@ def fresh_learner_curve(
         excess_loss_steps = excess
     )
 
-def main():
-    parser = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
+def score(
+    results,
+    checkpoint_dir = None,
+    out = None,
+    part = 'ab',
+    steps = 300,
+    threads = 3
+):
+    torch.set_num_threads(threads)
 
-    parser.add_argument('--results', type = str, required = True)
-    parser.add_argument('--checkpoint-dir', type = str)
-    parser.add_argument('--out', type = str)
-    parser.add_argument('--part', choices = ('a', 'b', 'ab'), default = 'ab')
-    parser.add_argument('--steps', type = int, default = 300)
-    parser.add_argument('--threads', type = int, default = 3)
-
-    args = parser.parse_args()
-    torch.set_num_threads(args.threads)
-
-    results = json.loads(Path(args.results).read_text())
+    results_path = Path(results)
+    results = json.loads(results_path.read_text())
     config = results['config']
 
     executor = Brainfuck(max_output_len = config['max_output'])
 
-    out = Path(default(args.out, Path(args.results).parent / 'learnability'))
+    out = Path(default(out, results_path.parent / 'learnability'))
     out.mkdir(parents = True, exist_ok = True)
 
-    checkpoint_dir = default(args.checkpoint_dir, str(Path(args.results).parent / 'checkpoints'))
+    checkpoint_dir = default(checkpoint_dir, str(results_path.parent / 'checkpoints'))
 
     # merge into any existing scores so parts can be recomputed independently
 
@@ -193,20 +191,20 @@ def main():
         existing = json.loads((out / 'learnability.json').read_text())
         saved.update({key: existing.get(key) for key in ('part_a', 'part_b')})
 
-    if 'a' in args.part:
+    if 'a' in part:
         print('part A - per program loss across self-play checkpoints')
         rounds, curves = self_play_curves(results, executor, checkpoint_dir)
         saved['part_a'] = dict(rounds = rounds, curves = curves)
         print(f'  {len(rounds)} checkpoints, {len(curves)} programs')
 
-    if 'b' in args.part:
+    if 'b' in part:
         print('part B - fresh learner epiplexity per program')
 
         part_b = saved['part_b'] or {}
         start = time.time()
 
         for name, program in program_set(results, executor).items():
-            part_b[name] = fresh_learner_curve(executor, program, config, steps = args.steps)
+            part_b[name] = fresh_learner_curve(executor, program, config, steps = steps)
             print(f'  {name} floor {part_b[name]["floor_bits_per_byte"]:.3f} bits/byte, excess {part_b[name]["excess_loss_steps"]:.1f} ({time.time() - start:.0f}s)')
 
         saved['part_b'] = part_b
@@ -273,4 +271,4 @@ def make_plot(saved, path):
     plt.close(fig)
 
 if __name__ == '__main__':
-    main()
+    Fire(score)

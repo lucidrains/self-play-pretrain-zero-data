@@ -48,7 +48,8 @@ test = [
 
 [dependency-groups]
 dev = [
-    "pytest"
+    "fire>=0.7.1",
+    "pytest",
 ]
 
 [tool.pytest.ini_options]
