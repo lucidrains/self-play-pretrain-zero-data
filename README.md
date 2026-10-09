@@ -1,6 +1,6 @@
 <img src="./self-play-fig1.png" width="400px"></img>
 
-## Self-Play Pretraining with Zero Data (wip)
+## Self-Play Pretraining with Zero Data
 
 Implementation of [Self-Play Pretraining with Zero Data](https://arxiv.org/abs/2609.30063)
 
