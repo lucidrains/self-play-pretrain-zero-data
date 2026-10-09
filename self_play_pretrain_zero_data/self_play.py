@@ -959,10 +959,11 @@ class SelfPlay(Module):
         prompt_len = 1,  # 1 for start token
         log_ratio_clamp = (-20., 20.),
         length_normalize = False,
-        length_normalize_kl = False,
+        length_normalize_kl = True,
         seq_mask = None,
         pg_mask = None,  # (b) rows entering the policy gradient, mutations excluded
-        kl_loss_weight = 1.,
+        kl_loss_weight = 0.01,
+        normalize_combined_advantage = False,
         prior_generator = None,
     ):
         generator = self.unwrapped_generator
@@ -989,13 +990,18 @@ class SelfPlay(Module):
 
         seq_lens = seq_mask.sum(dim = -1).clamp_min(1.)
 
-        normed_rewards = z_score(rewards)
         kl_to_prior = (log_probs - prior_log_probs).detach()
 
         if length_normalize_kl:
             kl_to_prior = kl_to_prior / seq_lens
 
-        advantages = normed_rewards - kl_loss_weight * kl_to_prior
+        kl = kl_loss_weight * kl_to_prior
+
+        # paper normalizes the reward alone, then subtracts the kl
+        # `normalize_combined_advantage` z-scores the combined objective instead, so advantages stay
+        # mean zero even when an unnormalized kl would otherwise dominate the reward
+
+        advantages = z_score(rewards - kl) if normalize_combined_advantage else z_score(rewards) - kl
 
         # sequence importance ratio
 
@@ -1012,7 +1018,7 @@ class SelfPlay(Module):
         else:
             grpo_loss = row_loss.mean()
 
-        return grpo_loss, (normed_rewards, kl_to_prior), log_probs
+        return grpo_loss, (advantages, kl_to_prior), log_probs
 
     def expert_iter_loss(
         self,

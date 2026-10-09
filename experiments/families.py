@@ -9,6 +9,8 @@ every start in 0..30
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
+from math import ceil
 from random import Random
 
 from self_play_pretrain_zero_data.executors.base import exists
@@ -92,12 +94,14 @@ def family_of(output, tape_len):
 
 # uniform prior baseline, sample the augmented alphabet until the halt symbol
 
-def uniform_baseline(executor, num_samples, seed, max_length = 64):
-    rng = Random(seed)
+def _uniform_baseline_shard(args):
+    executor, num_samples, program_seed, execute_seed, max_length = args
+
+    rng = Random(program_seed)
     counts = dict.fromkeys(FAMILIES, 0)
     halt = getattr(executor, 'halt_symbol', None)
 
-    for index in range(num_samples):
+    for _ in range(num_samples):
         program = ''
 
         for _ in range(max_length):
@@ -107,11 +111,31 @@ def uniform_baseline(executor, num_samples, seed, max_length = 64):
             if exists(halt) and char == halt:
                 break
 
-        for family in detect(executor.execute(program, seed = seed).output, executor.max_output_len):
+        for family in detect(executor.execute(program, seed = execute_seed).output, executor.max_output_len):
             counts[family] += 1
 
-        if num_samples >= 100_000 and (index + 1) % 100_000 == 0:
-            print(f'  uniform baseline {index + 1}/{num_samples} -> {counts}', flush = True)
+    return counts
+
+def uniform_baseline(executor, num_samples, seed, max_length = 64, workers = 1):
+    workers = max(int(workers), 1)
+
+    if workers == 1:
+        print(f'  uniform baseline {num_samples} programs', flush = True)
+        return _uniform_baseline_shard((executor, num_samples, seed, seed, max_length))
+
+    shard = ceil(num_samples / workers)
+    args = [(executor, min(shard, num_samples - i * shard), seed + i, seed, max_length) for i in range(workers) if i * shard < num_samples]
+
+    print(f'  uniform baseline {num_samples} programs over {len(args)} workers', flush = True)
+
+    counts = dict.fromkeys(FAMILIES, 0)
+
+    with ProcessPoolExecutor(max_workers = len(args)) as pool:
+        for result in pool.map(_uniform_baseline_shard, args):
+            for family, count in result.items():
+                counts[family] += count
+
+    print(f'  uniform baseline done -> {counts}', flush = True)
 
     return counts
 

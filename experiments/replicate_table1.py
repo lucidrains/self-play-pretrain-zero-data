@@ -103,10 +103,10 @@ def train(
     rounds = 2000,
     minutes = 30.,
     batch_size = 64,
-    detect_samples = 96,
+    detect_samples = 256,
     max_length = 32,
-    max_output = 96,
-    max_steps = 100_000,
+    max_output = 256,
+    max_steps = 500_000,
     dim = 192,
     depth = 3,
     heads = 6,
@@ -118,13 +118,15 @@ def train(
     report_every = 8,
     threads = min(8, os.cpu_count() or 1),
     seed = 0,
-    reference = 'ema',
+    reference = 'checkpoint',
     executor = 'brainfuck',
     ablate_generator = 'none',
     ablate_reward = 'none',
     ablate_proposals = 'none',
-    kl_weight = 1.,
-    length_normalize_kl = False,
+    kl_weight = 0.01,
+    length_normalize_kl = True,
+    normalize_combined_advantage = True,
+    representation_alignment_loss_weight = 0.0,
     bucketed_archive = False,
     device = 'cpu',
     resume_generator = None,
@@ -158,7 +160,7 @@ def train(
 
     reference = EMAReference(decay = config.ema_decay) if config.reference == 'ema' else LookbackCheckpointReference(folder = out / 'checkpoints')
     generator_lr = 0. if config.ablate_generator == 'frozen' else config.generator_lr
-    proposals = None if config.ablate_proposals == 'none' else dict(fresh = 1.)
+    proposals = dict(fresh = 2., mutation = 1., replay = 1.) if config.ablate_proposals == 'none' else dict(fresh = 1.)
 
     self_play = SelfPlay(
         generator,
@@ -169,18 +171,22 @@ def train(
         learner_lr = config.learner_lr,
         generator_lr = generator_lr,
         learner_reference = reference,
+        representation_alignment_loss_weight = config.representation_alignment_loss_weight,
         proposals = proposals
     )
 
-    if config.kl_weight != 1. or config.length_normalize_kl:
-        # the unnormalized sequence KL can dominate the z-scored reward, the paper tunes this weight
+    # per token kl with a small weight keeps the regularizer from dominating the z-scored reward
 
-        def grpo_with_kl(rewards, **kwargs):
-            kwargs.update(kl_loss_weight = config.kl_weight, length_normalize_kl = config.length_normalize_kl)
-            return original_grpo(rewards, **kwargs)
+    def grpo_with_kl(rewards, **kwargs):
+        kwargs.update(
+            kl_loss_weight = config.kl_weight,
+            length_normalize_kl = config.length_normalize_kl,
+            normalize_combined_advantage = config.normalize_combined_advantage
+        )
+        return original_grpo(rewards, **kwargs)
 
-        original_grpo = self_play.grpo_loss
-        self_play.grpo_loss = grpo_with_kl
+    original_grpo = self_play.grpo_loss
+    self_play.grpo_loss = grpo_with_kl
 
     if config.ablate_reward != 'none':
 
@@ -204,7 +210,7 @@ def train(
     save()
 
     if config.baseline_samples > 0:
-        baseline_hits = uniform_baseline(executor, config.baseline_samples, config.seed)
+        baseline_hits = uniform_baseline(executor, config.baseline_samples, config.seed, workers = config.threads)
         save()
 
     print(f'uniform baseline over {config.baseline_samples} programs -> {baseline_hits}', flush = True)

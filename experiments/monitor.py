@@ -142,7 +142,7 @@ function renderArchive(s) {
     tr.append(el('td', 'num', r.reward.toFixed(2)), el('td', 'num', `${r.length} / ${fmt(r.loops)}`));
     body.append(tr);
   }
-  $('shown').textContent = `${rows.length} shown · archive ${fmt(s.archive_size)} · rewards decay 0.97/round`;
+  $('shown').textContent = `${rows.length} shown · archive ${fmt(s.archive_size)} · sorted by learning reward`;
 }
 
 function drawLoss(s) {
