@@ -1,5 +1,6 @@
 from self_play_pretrain_zero_data.self_play import (
     CheckpointReference,
+    DisagreementReward,
     EMAReference,
     LearnerReference,
     SelfPlay,

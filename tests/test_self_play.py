@@ -383,3 +383,37 @@ def test_self_play_archives_age_every_epoch():
 
     assert entry.age == 1
     assert entry.reward == 2.
+
+def test_self_play_with_disagreement():
+    torch.manual_seed(0)
+
+    executor = Brainfuck()
+
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 32, depth = 1, dim_head = 8, heads = 4)
+    learner = Transformer(num_tokens = 256 + 1, dim = 32, depth = 1, dim_head = 8, heads = 4)
+
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        learner_reference = EMAReference(decay = 0.99),
+        use_disagreement = True,
+        disagreement_weight = 0.5,
+        num_disagreement_models = 3
+    )
+
+    assert len(self_play.disagreement_models) == 2
+
+    ids = char_encode(['', 'ABC', 'XYZXYZ'])
+    disagreement = self_play.disagreement(ids)
+
+    assert disagreement.shape == (3,)
+    assert disagreement[0].item() == 0.
+    assert (disagreement[1:] > 0.).all()
+
+    losses, tangents = self_play(batch_size = 2, max_length = 8, verbose = False, epochs = 2, decode_fn = executor.decode)
+
+    assert losses.shape == (2,)
+    assert tangents.shape == (2, 2)
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(tangents).all()

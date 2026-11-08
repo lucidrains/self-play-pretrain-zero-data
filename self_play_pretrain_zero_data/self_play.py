@@ -18,7 +18,7 @@ from accelerate import Accelerator
 
 from ema_pytorch import EMA
 
-from einops import einsum, rearrange
+from einops import einsum, rearrange, reduce
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import batched_index_select, clamp, lens_to_mask, masked_mean, masked_sum, maybe_return, pack_with_inverse, pad_left_at_dim, pad_sequence, temp_eval, tree_map_detach, z_score
@@ -510,6 +510,11 @@ class Transformer(Module):
 
         return seq_loss, seq_loss_tangent
 
+    def next_token_probs(self, ids):
+        inp, labels = ids[:, :-1], ids[:, 1:]
+        probs = self.forward(inp, return_loss = False).softmax(dim = -1)
+        return batched_index_select(probs, labels.clamp_min(0), dim = -1)
+
     @maybe_return('pooled_repr', primary = transformer_primary_fields)
     def forward(
         self,
@@ -742,6 +747,45 @@ class EMAReference(LearnerReference):
 
         return dict(self.ema.ema_model.named_parameters())
 
+# disagreement reward - epistemic spread across an ensemble of learners, gating out noisy tv outputs
+
+def clone_and_reset(model):
+    cloned = deepcopy(model)
+
+    for module in cloned.modules():
+        if hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
+
+    return cloned
+
+class DisagreementReward(Module):
+    def __init__(
+        self,
+        models,
+        predict_fn = None,
+        mask_fn = None
+    ):
+        super().__init__()
+
+        models = [models] if isinstance(models, Module) else list(models)
+        assert len(models) > 1, 'at least two models are needed to measure disagreement'
+
+        self.models = ModuleList(models)
+        self.predict_fn = default(predict_fn, lambda model, data: model(data))
+        self.mask_fn = mask_fn
+
+    @torch.no_grad()
+    @move_inputs_to_module_device
+    def forward(self, data):
+        predictions = stack([self.predict_fn(model, data) for model in self.models])
+
+        spread = predictions.var(dim = 0)
+
+        if exists(self.mask_fn):
+            return masked_mean(spread, self.mask_fn(data), dim = -1)
+
+        return reduce(spread, 'b ... -> b', 'mean')
+
 # classes
 
 # self play
@@ -768,7 +812,11 @@ class SelfPlay(Module):
         expert_iter_loss_weight = 1.0,
         representation_alignment_loss_weight = 0.0,
         learner_reference = None,
-        proposals = None
+        proposals = None,
+        use_disagreement = False,
+        disagreement_weight = 1.,
+        num_disagreement_models = 4,
+        disagreement_models = None
     ):
         super().__init__()
 
@@ -839,6 +887,24 @@ class SelfPlay(Module):
 
         self.generator_prior = None
 
+        # optional learner ensemble for epistemic disagreement
+
+        use_disagreement = use_disagreement and disagreement_weight > 0.
+
+        self.use_disagreement = use_disagreement
+        self.disagreement_weight = disagreement_weight
+        self.disagreement = None
+
+        if use_disagreement and not exists(disagreement_models):
+            assert num_disagreement_models >= 2, 'at least two learners in total are needed for disagreement'
+            disagreement_models = [clone_and_reset(learner) for _ in range(num_disagreement_models - 1)]
+
+        disagreement_models = default(disagreement_models, [])
+        disagreement_optimizers = [
+            AdamW(aux_learner.parameters(), lr = learner_lr, weight_decay = learner_weight_decay)
+            for aux_learner in disagreement_models
+        ]
+
         # hand models and optimizers over to accelerate for placement and wrapping
 
         (
@@ -852,6 +918,16 @@ class SelfPlay(Module):
             generator_optimizer,
             learner_optimizer
         )
+
+        self.disagreement_models = ModuleList([self.accelerator.prepare(aux_learner) for aux_learner in disagreement_models])
+        self.disagreement_optimizers = [self.accelerator.prepare(aux_opt) for aux_opt in disagreement_optimizers]
+
+        if use_disagreement:
+            self.disagreement = DisagreementReward(
+                [self.unwrapped_learner, *(self.accelerator.unwrap_model(m) for m in self.disagreement_models)],
+                predict_fn = lambda model, ids: model.next_token_probs(ids),
+                mask_fn = lambda ids: (ids[:, 1:] != self.unwrapped_learner.pad_id) & (ids[:, 1:] != 0)
+            )
 
         # reference learner parameters the generator reward is derived against, checkpoint lookback by default
 
@@ -1198,6 +1274,17 @@ class SelfPlay(Module):
             self.learner_optimizer.step()
             self.learner_optimizer.zero_grad()
 
+            if self.use_disagreement:
+                for aux_learner, aux_optimizer in zip(self.disagreement_models, self.disagreement_optimizers):
+                    aux_loss = aux_learner(ids, return_loss = True, reduce_loss = True)
+                    self.accelerator.backward(aux_loss)
+
+                    if exists(self.learner_max_grad_norm):
+                        self.accelerator.clip_grad_norm_(aux_learner.parameters(), self.learner_max_grad_norm)
+
+                    aux_optimizer.step()
+                    aux_optimizer.zero_grad()
+
             # advance step, fold the learner step into the reference
 
             self.epoch.add_(1)
@@ -1209,9 +1296,13 @@ class SelfPlay(Module):
 
             _, loss_tangent = learner.forward_with_jvp(ids, tangent)
 
-            # generator reward - alignment with the learner's preconditioned parameter movement
+            # generator reward - alignment with the learner's preconditioned parameter movement,
+            # optionally gated by epistemic ensemble disagreement
 
             rewards = loss_tangent.abs()
+
+            if self.use_disagreement:
+                rewards = rewards * (self.disagreement(ids) ** self.disagreement_weight)
 
             rl_loss, _, program_log_probs = self.grpo_loss(
                 rewards,
