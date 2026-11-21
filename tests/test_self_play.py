@@ -7,7 +7,7 @@ from torch.optim import AdamW, SGD
 
 from torch_einops_utils import masked_mean
 
-from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, QualityDiversityArchive, SelfPlay
+from self_play_pretrain_zero_data import Brainfuck, CheckpointReference, EMAReference, Executor, Forth, NeuralCellularAutomata, QualityDiversityArchive, SelfPlay, fresh_programs, replay_programs
 from self_play_pretrain_zero_data.self_play import HAS_JVP_FLASH_ATTENTION, Transformer, char_decode, char_encode, exists, register_preconditioning, representation_alignment_loss, rewards_to_loss_weights
 
 HAS_TRITON = find_spec('triton') is not None
@@ -417,3 +417,96 @@ def test_self_play_with_disagreement():
     assert tangents.shape == (2, 2)
     assert torch.isfinite(losses).all()
     assert torch.isfinite(tangents).all()
+
+def test_train_and_replay_log_probs_match(tmp_path):
+    torch.manual_seed(0)
+
+    executor = Brainfuck()
+
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 32, depth = 2, dim_head = 8, heads = 4)
+    learner = Transformer(num_tokens = 256 + 1, dim = 32, depth = 2, dim_head = 8, heads = 4)
+    archive = QualityDiversityArchive(executor = executor)
+
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        archive = archive,
+        generator_lr = 3e-3,
+        learner_reference = CheckpointReference(folder = tmp_path)
+    )
+
+    # fresh rollout log probs match grpo replay, self-prior kl is zero, post-terminator tokens are masked
+
+    fresh = fresh_programs(self_play, 16, max_length = 12, filter_thres = 0., decode_fn = executor.decode)
+
+    eos_ids = (executor.sos_eos_id, executor.halt_id)
+    terminated = torch.isin(fresh.decoded_ids[:, 1:], torch.tensor(eos_ids, device = self_play.device))
+    assert not fresh.seq_mask[:, 2:][terminated[:, :-1].cumsum(dim = -1) > 0].any()
+
+    self_play.advance_generator_prior()
+    rewards = torch.linspace(1., 2., len(fresh), device = self_play.device)
+
+    _, (_, kl_to_prior), replay_log_probs = self_play.grpo_loss(
+        rewards,
+        old_log_probs = fresh.old_log_probs,
+        replay_ids = fresh.decoded_ids,
+        seq_mask = fresh.seq_mask,
+        prior_generator = self_play.generator_prior
+    )
+
+    assert torch.allclose(replay_log_probs, fresh.old_log_probs, atol = 1e-4)
+    assert torch.allclose(kl_to_prior, torch.zeros_like(kl_to_prior), atol = 1e-4)
+
+    # program batch -> archive -> replay round trip
+
+    programs = ['+.', '+[.++]F', '+[.L>]F']
+    batch = self_play.program_batch(programs, pg = True, admit = True)
+    batch_rewards = torch.tensor([1., 2., 3.], device = self_play.device)
+
+    _, _, batch_log_probs = self_play.grpo_loss(
+        batch_rewards,
+        old_log_probs = batch.old_log_probs,
+        replay_ids = batch.decoded_ids,
+        seq_mask = batch.seq_mask,
+        pg_mask = batch.pg_mask
+    )
+
+    assert torch.allclose(batch_log_probs, batch.old_log_probs, atol = 1e-4)
+
+    self_play.update_archive(batch, [executor.execute(p) for p in programs], batch_rewards, batch_log_probs.detach())
+
+    replayed = replay_programs(self_play, len(programs))
+
+    _, _, replayed_log_probs = self_play.grpo_loss(
+        torch.ones(len(replayed), device = self_play.device),
+        old_log_probs = replayed.old_log_probs,
+        replay_ids = replayed.decoded_ids,
+        seq_mask = replayed.seq_mask,
+        pg_mask = replayed.pg_mask
+    )
+
+    assert torch.allclose(replayed_log_probs, replayed.old_log_probs, atol = 1e-4)
+
+    # expert iteration must learn to autoregressively emit the target program
+
+    target = self_play.program_batch(['+[.L>]F'], pg = True)
+    ones = torch.ones(1, device = self_play.device)
+
+    for _ in range(60):
+        _, _, log_probs = self_play.grpo_loss(ones, old_log_probs = target.old_log_probs, replay_ids = target.decoded_ids, seq_mask = target.seq_mask)
+        loss = self_play.expert_iter_loss(ones, log_probs)
+        self_play.accelerator.backward(loss)
+        self_play.generator_optimizer.step()
+        self_play.generator_optimizer.zero_grad()
+
+    generated = self_play.unwrapped_generator.generate(
+        batch_size = 16,
+        max_length = 12,
+        sos_id = executor.sos_eos_id,
+        eos_ids = eos_ids,
+        decode_fn = executor.decode,
+        filter_thres = 0.
+    )
+
+    assert generated.count('+[.L>]F') >= 8

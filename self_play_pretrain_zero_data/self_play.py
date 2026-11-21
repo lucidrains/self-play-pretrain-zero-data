@@ -430,7 +430,8 @@ class Transformer(Module):
 
         generated = out[:, prompt_len:]
 
-        after_terminator = isin(generated, termination_ids).cumsum(dim = -1) > 1
+        has_terminated = isin(generated, termination_ids).cumsum(dim = -1) > 0
+        after_terminator = pad_left_at_dim(has_terminated[:, :-1], 1, value = False)
 
         generated.masked_fill_(after_terminator, pad_value)
 
@@ -510,10 +511,16 @@ class Transformer(Module):
 
         return seq_loss, seq_loss_tangent
 
-    def next_token_probs(self, ids):
+    def next_token_log_probs(self, ids):
+        if ids.shape[-1] <= 1:
+            return ids.new_zeros((ids.shape[0], 0), dtype = torch.float)
+
         inp, labels = ids[:, :-1], ids[:, 1:]
-        probs = self.forward(inp, return_loss = False).softmax(dim = -1)
-        return batched_index_select(probs, labels.clamp_min(0), dim = -1)
+        log_probs = self.forward(inp, return_loss = False).log_softmax(dim = -1)
+        return batched_index_select(log_probs, labels.clamp_min(0), dim = -1)
+
+    def next_token_probs(self, ids):
+        return self.next_token_log_probs(ids).exp()
 
     @maybe_return('pooled_repr', primary = transformer_primary_fields)
     def forward(
@@ -1011,10 +1018,7 @@ class SelfPlay(Module):
         # prior generator - advanced past the fixed uniform prior
 
         if exists(prior_generator):
-            logits = prior_generator(replay_ids, return_loss = False)
-            log_probs = batched_index_select(logits.log_softmax(dim = -1), replay_ids, dim = -1)
-
-            return masked_sum(log_probs, seq_mask, dim = -1)
+            return masked_sum(prior_generator.next_token_log_probs(replay_ids), seq_mask[:, 1:], dim = -1)
 
         # uniform prior over programs - shorter programs are more likely
         # g0(x) = |A| ** -l(x), with l(x) up to and including the terminator and token id 0 excluded
@@ -1050,12 +1054,8 @@ class SelfPlay(Module):
 
         # replay log probs
 
-        replay_logits = generator(replay_ids, return_loss = False)
-        replay_log_probs = replay_logits.log_softmax(dim = -1)
-
-        token_log_probs = batched_index_select(replay_log_probs, replay_ids, dim = -1)
-
-        log_probs = masked_sum(token_log_probs, seq_mask, dim = -1)
+        token_log_probs = generator.next_token_log_probs(replay_ids)
+        log_probs = masked_sum(token_log_probs, seq_mask[:, 1:], dim = -1)
 
         if old_log_probs.ndim == 2:
             old_log_probs = masked_sum(old_log_probs, seq_mask, dim = -1)
@@ -1133,10 +1133,7 @@ class SelfPlay(Module):
         elif pg:
             # no stored proposal log prob, current pre-update generator stands in, ratio of one
 
-            logits = generator(decoded_ids, return_loss = False)
-            token_log_probs = batched_index_select(logits.log_softmax(dim = -1), decoded_ids.clamp_min(0), dim = -1)
-
-            old_log_probs = masked_sum(token_log_probs, seq_mask, dim = -1)
+            old_log_probs = masked_sum(generator.next_token_log_probs(decoded_ids), seq_mask[:, 1:], dim = -1)
         else:
             old_log_probs = torch.zeros(b, device = device)
 
