@@ -510,3 +510,38 @@ def test_train_and_replay_log_probs_match(tmp_path):
     )
 
     assert generated.count('+[.L>]F') >= 8
+
+@pytest.mark.parametrize('jvp_reward_mode', ('abs', 'relu', 'signed'))
+def test_jvp_reward_modes(jvp_reward_mode):
+    torch.manual_seed(0)
+
+    executor = Brainfuck()
+    generator = Transformer(num_tokens = executor.num_tokens, dim = 16, depth = 1, dim_head = 8, heads = 2)
+    learner = Transformer(num_tokens = 256 + 1, dim = 16, depth = 1, dim_head = 8, heads = 2)
+    archive = QualityDiversityArchive(executor = executor)
+
+    self_play = SelfPlay(
+        generator = generator,
+        learner = learner,
+        executor = executor,
+        archive = archive,
+        learner_reference = EMAReference(decay = 0.9),
+        jvp_reward_mode = jvp_reward_mode
+    )
+
+    tangents = torch.tensor([-2.0, 0.0, 3.0])
+    rewards = self_play.jvp_to_reward(tangents)
+
+    if jvp_reward_mode == 'abs':
+        assert torch.allclose(rewards, torch.tensor([2.0, 0.0, 3.0]))
+    elif jvp_reward_mode == 'relu':
+        assert torch.allclose(rewards, torch.tensor([0.0, 0.0, 3.0]))
+    elif jvp_reward_mode == 'signed':
+        assert torch.allclose(rewards, torch.tensor([-2.0, 0.0, 3.0]))
+
+    losses, loss_tangents = self_play(batch_size = 4, max_length = 8, verbose = False, epochs = 2)
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(loss_tangents).all()
+
+    with pytest.raises(AssertionError):
+        SelfPlay(generator, learner, executor, jvp_reward_mode = 'invalid')

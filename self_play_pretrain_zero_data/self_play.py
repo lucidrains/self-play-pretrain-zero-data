@@ -823,7 +823,8 @@ class SelfPlay(Module):
         use_disagreement = False,
         disagreement_weight = 1.,
         num_disagreement_models = 4,
-        disagreement_models = None
+        disagreement_models = None,
+        jvp_reward_mode = 'abs'
     ):
         super().__init__()
 
@@ -893,6 +894,11 @@ class SelfPlay(Module):
         # generator prior for the kl, uniform by default
 
         self.generator_prior = None
+
+        # jvp reward mode - 'abs' (paper default), 'relu' (positive learning progress only), or 'signed' (penalizes forgetting in grpo)
+
+        assert jvp_reward_mode in ('abs', 'relu', 'signed'), f'unknown jvp reward mode {jvp_reward_mode!r}'
+        self.jvp_reward_mode = jvp_reward_mode
 
         # optional learner ensemble for epistemic disagreement
 
@@ -1194,6 +1200,16 @@ class SelfPlay(Module):
 
         self.archive.advance_age()
 
+    def jvp_to_reward(self, loss_tangent):
+        # positive loss_tangent = <grad L, P (theta_ref - theta)> ~ L(theta_ref) - L(theta) (learning progress)
+        if self.jvp_reward_mode == 'abs':
+            return loss_tangent.abs()
+        elif self.jvp_reward_mode == 'relu':
+            return F.relu(loss_tangent)
+        elif self.jvp_reward_mode == 'signed':
+            return loss_tangent
+        raise ValueError(f'unknown jvp reward mode {self.jvp_reward_mode!r}')
+
     def forward(
         self,
         batch_size = 16,
@@ -1296,7 +1312,7 @@ class SelfPlay(Module):
             # generator reward - alignment with the learner's preconditioned parameter movement,
             # optionally gated by epistemic ensemble disagreement
 
-            rewards = loss_tangent.abs()
+            rewards = self.jvp_to_reward(loss_tangent)
 
             if self.use_disagreement:
                 rewards = rewards * (self.disagreement(ids) ** self.disagreement_weight)
