@@ -68,6 +68,9 @@ def representation_alignment_loss(
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
 
+def safe_div(num, den, eps = 1e-20):
+    return num / den.clamp_min(eps)
+
 def gumbel_noise_like(t):
     noise = torch.rand_like(t)
     return -log(-log(noise))
@@ -1315,7 +1318,11 @@ class SelfPlay(Module):
             rewards = self.jvp_to_reward(loss_tangent)
 
             if self.use_disagreement:
-                rewards = rewards * (self.disagreement(ids) ** self.disagreement_weight)
+                # normalize disagreement gate to unit mean so rewards stay on the same scale as kl
+
+                disagreement = self.disagreement(ids)
+                gate = safe_div(disagreement, disagreement.mean()) ** self.disagreement_weight
+                rewards = rewards * safe_div(gate, gate.mean())
 
             rl_loss, _, program_log_probs = self.grpo_loss(
                 rewards,
